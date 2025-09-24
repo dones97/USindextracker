@@ -126,9 +126,8 @@ def compute_monthly_returns(curve):
     returns = []
     months = month_ends.index
     for i in range(len(months)):
-        end = months[i]
-        start_value = month_starts.iloc[i]
         end_value = month_ends.iloc[i]
+        start_value = month_starts.iloc[i]
         if pd.isna(start_value) or start_value == 0:
             returns.append(np.nan)
             continue
@@ -144,14 +143,29 @@ def compute_annual_returns(curve):
     years = year_ends.index
     returns = []
     for i in range(len(years)):
-        start_value = year_starts.iloc[i]
         end_value = year_ends.iloc[i]
+        start_value = year_starts.iloc[i]
         if pd.isna(start_value) or start_value == 0:
             returns.append(np.nan)
             continue
         ret = (end_value - start_value) / start_value * 100
         returns.append(ret)
     return pd.Series(returns, index=years)
+
+def wrap_labels(labels, width=15):
+    wrapped = []
+    for label in labels:
+        # Try to break at spaces, otherwise just insert <br> every width chars
+        parts = []
+        while len(label) > width:
+            idx = label[:width].rfind(' ')
+            if idx == -1:
+                idx = width
+            parts.append(label[:idx])
+            label = label[idx:].lstrip()
+        parts.append(label)
+        wrapped.append('<br>'.join(parts))
+    return wrapped
 
 def main():
     st.title("Portfolio Analysis (Correct Realized/Unrealized Profits)")
@@ -169,7 +183,6 @@ def main():
     df = read_uploaded_files(uploaded_files)
     df = preprocess_trades(df)
     symbols = get_symbol_list(df)
-    # --- Fund name lookup ---
     symbol_name_map = get_symbol_name_map(df)
     t0 = df["Run Date"].min() - pd.Timedelta(days=5)
     t1 = datetime.today()
@@ -238,22 +251,28 @@ def main():
         invested = -sum([amt for date, amt in symbol_cashflows if amt < 0])
         end_value = curve['CurrentValue'].iloc[-1] + curve['Realized'].iloc[-1]
         total_ret = (end_value / invested - 1) if invested != 0 else 0
-        # Use fund name
         fund_name = symbol_name_map.get(symbol, symbol)
         symbol_xirr.append((symbol, fund_name, sym_xirr))
         symbol_total_return.append((fund_name, total_ret * 100))
 
     # Bar chart: total return % per fund
     sym_df = pd.DataFrame(symbol_total_return, columns=["Fund Name", "TotalReturn"])
+    wrapped_fund_names = wrap_labels(sym_df["Fund Name"].tolist(), width=15)
     fig = go.Figure(data=[
-        go.Bar(name='Fund', x=sym_df["Fund Name"], y=sym_df["TotalReturn"])
+        go.Bar(name='Fund', x=wrapped_fund_names, y=sym_df["TotalReturn"])
     ])
-    fig.update_layout(barmode='group', title="Fund Total Return (%)", yaxis_title="Return (%)")
+    fig.update_layout(
+        barmode='group',
+        title="Fund Total Return (%)",
+        yaxis_title="Return (%)",
+        xaxis_title="Fund",
+        xaxis_tickangle=0,
+        margin=dict(b=120),
+    )
     st.plotly_chart(fig, use_container_width=True)
 
     # Data Table: XIRR per fund
     table_df = pd.DataFrame(symbol_xirr, columns=["Symbol", "Fund Name", "XIRR"])
-    # Show only Fund Name and XIRR for clarity
     st.dataframe(table_df[["Fund Name", "XIRR"]].style.format({"XIRR": "{:.2%}"}))
 
     # --- 3. Portfolio Cumulative Profits ---
