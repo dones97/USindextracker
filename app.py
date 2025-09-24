@@ -44,15 +44,15 @@ def get_price_history(symbol, start, end):
     return close_px
 
 def build_portfolio_profit_curve(trades, prices):
+    # --- Forward fill prices for all calendar days ---
     prices = prices[~prices.index.duplicated(keep='last')]
     prices = prices.sort_index()
     all_days = pd.date_range(prices.index.min(), prices.index.max(), freq='D')
-
-    # Prepare all trades sorted by date
+    # Forward-fill prices for weekends/holidays
+    ff_prices = prices.reindex(all_days).ffill()
     trades = trades.sort_values('Run Date')
     trades = trades.set_index('Run Date')
 
-    # Track lots: each buy is added as a lot (qty, cost per unit)
     lots = []
     realized_profits = []  # (date, realized profit from sells/dividends)
     profit_curve = []
@@ -64,10 +64,8 @@ def build_portfolio_profit_curve(trades, prices):
                 amt = float(row["Amount ($)"])
                 if "YOU BOU" in row["Action"]:
                     price = float(row["Price ($)"])
-                    # Add a new lot for each buy
                     lots.append({"qty": qty, "cost": price})
                 elif "YOU SOLD" in row["Action"]:
-                    # Remove from lots FIFO
                     sell_qty = qty
                     sell_price = float(row["Price ($)"])
                     profit = 0
@@ -83,20 +81,11 @@ def build_portfolio_profit_curve(trades, prices):
                             lot["qty"] -= sell_qty
                         profit += (sell_price - lot_cost) * this_qty
                         sell_qty -= this_qty
-                    # If more sold than held, treat as all sold from existing lots (should not happen)
                     realized_profits.append((date, profit))
                 elif "DIVIDEND" in row["Action"]:
                     realized_profits.append((date, amt))
 
-        # At each date, compute:
-        # - Total quantity held and weighted average cost
-        # - Unrealized profit = (current price - lot cost) * qty for all open lots
-        # - Realized profit so far = sum of realized_profits up to now
-        if date in prices.index:
-            px = float(prices.loc[date])
-        else:
-            px = np.nan
-
+        px = float(ff_prices.loc[date]) if not np.isnan(ff_prices.loc[date]) else np.nan
         unrealized = 0.0
         for lot in lots:
             unrealized += (px - lot["cost"]) * lot["qty"] if not np.isnan(px) else 0.0
@@ -112,51 +101,16 @@ def build_portfolio_profit_curve(trades, prices):
         })
     return pd.DataFrame(profit_curve).set_index("Date")
 
-def portfolio_cashflows_for_xirr(df, prices, end_date):
-    # Cash outflows (buys, negative), inflows (sells, positive), dividends (positive), plus final value of holdings
-    cashflows = []
-    for _, row in df.iterrows():
-        amt = float(row["Amount ($)"])
-        cashflows.append((row["Run Date"], amt))
-    # Add a final inflow of value of all holdings at end_date (simulate complete liquidation)
-    # Calculate total qty and cost per symbol
-    lots = []
-    for _, row in df.iterrows():
-        qty = row["Quantity"]
-        if "YOU BOU" in row["Action"]:
-            lots.append({"qty": qty, "cost": float(row["Price ($)"])})
-        elif "YOU SOLD" in row["Action"]:
-            sell_qty = qty
-            # Remove from lots FIFO
-            while sell_qty > 0 and lots:
-                lot = lots[0]
-                lot_qty = lot["qty"]
-                if lot_qty <= sell_qty:
-                    this_qty = lot_qty
-                    lots.pop(0)
-                else:
-                    this_qty = sell_qty
-                    lot["qty"] -= sell_qty
-                sell_qty -= this_qty
-    # Now lots contains all open lots for all symbols
-    if len(lots) > 0 and end_date in prices.index:
-        px = float(prices.loc[end_date])
-        total_qty = sum([lot["qty"] for lot in lots])
-        if total_qty > 0:
-            cashflows.append((end_date, total_qty * px))
-    return cashflows
-
-def compute_period_returns(profit_curve, freq='M'):
-    # Use portfolio value curve (including realized and unrealized) to get monthly/annual returns
-    values = profit_curve['CurrentValue'] + profit_curve['Realized']
-    # Fill NAs forward for days with missing prices
+def compute_period_returns(curve, freq='M'):
+    # Use (current value + realized profit) as portfolio value
+    values = curve['CurrentValue'] + curve['Realized']
     values = values.ffill()
     period_val = values.resample(freq).last().dropna()
     returns = period_val.pct_change().dropna()
     return returns
 
 def main():
-    st.title("Portfolio Analysis (No S&P500, Correct Realized/Unrealized Profits)")
+    st.title("Portfolio Analysis (Correct Realized/Unrealized Profits)")
 
     uploaded_files = st.file_uploader(
         "Upload one or more files (Excel/CSV) from Fidelity.",
@@ -193,21 +147,14 @@ def main():
         for col in ['Unrealized', 'Realized', 'TotalProfit', 'CurrentValue', 'CurrentQty']:
             if col not in portfolio_curve.columns:
                 portfolio_curve[col] = 0.0
-            # Align index, fill missing as 0 for addition, then add
             vals = curve[col].reindex(portfolio_curve.index, fill_value=0.0)
             portfolio_curve[col] += vals
-    # Fill NAs in price-driven columns forward for value calculations
     for col in ['CurrentValue', 'CurrentQty']:
         portfolio_curve[col] = portfolio_curve[col].replace(0, np.nan).ffill().fillna(0.0)
-    # Realized profit line should not be cumulative sum; it's already cumulative
 
     # --- 1. Portfolio Level Metrics ---
     st.header("1. Portfolio-level Metrics")
-    # For XIRR and total return, use all trades and total value at end
-    # Reconstruct cashflows for XIRR from all trades
-    # For prices, use a "portfolio price" as weighted sum, or just use the sum from the curve
     end_date = portfolio_curve.index[-1]
-    # Use sum of symbol prices for final liquidation value
     values_for_xirr = portfolio_curve['CurrentValue'].iloc[-1]
     cashflows = []
     for _, row in df.iterrows():
@@ -260,9 +207,7 @@ def main():
         trades = df[df["Symbol"] == symbol]
         px = all_prices[symbol]
         curve = profit_curves[symbol]
-        # Cashflows and final liquidation for symbol XIRR
         end_date = curve.index[-1]
-        # For symbol, use symbol's current value at end
         symbol_value = curve['CurrentValue'].iloc[-1]
         symbol_cashflows = []
         for _, row in trades.iterrows():
@@ -277,7 +222,6 @@ def main():
         symbol_xirr.append((symbol, sym_xirr))
         symbol_total_return.append((symbol, total_ret * 100))
 
-    # Bar chart: total return % per symbol
     sym_df = pd.DataFrame(symbol_total_return, columns=["Symbol", "TotalReturn"])
     fig = go.Figure(data=[
         go.Bar(name='Symbol', x=sym_df["Symbol"], y=sym_df["TotalReturn"])
@@ -285,7 +229,6 @@ def main():
     fig.update_layout(barmode='group', title="Symbol Total Return (%)", yaxis_title="Return (%)")
     st.plotly_chart(fig, use_container_width=True)
 
-    # Data Table: XIRR per symbol
     table_df = pd.DataFrame(symbol_xirr, columns=["Symbol", "XIRR"])
     st.dataframe(table_df.style.format({"XIRR": "{:.2%}"}))
 
