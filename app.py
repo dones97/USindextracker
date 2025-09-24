@@ -259,7 +259,7 @@ def main():
     sym_df = pd.DataFrame(symbol_total_return, columns=["Fund Name", "TotalReturn"])
     wrapped_fund_names = wrap_labels(sym_df["Fund Name"].tolist(), width=15)
     fig = go.Figure(data=[
-        go.Bar(name='Fund', x=wrapped_fund_names, y=sym_df["TotalReturn"])
+        go.Bar(x=wrapped_fund_names, y=sym_df["TotalReturn"])
     ])
     fig.update_layout(
         barmode='group',
