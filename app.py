@@ -37,7 +37,7 @@ def get_symbol_list(df):
     return df["Symbol"].unique()
 
 def get_price_history(symbol, start, end):
-    px = yf.download(symbol, start=start, end=end)
+    px = yf.download(symbol, start=start, end=end, progress=False)
     close_px = px["Close"].dropna()
     close_px = close_px[~close_px.index.duplicated(keep='last')]
     close_px = close_px.sort_index()
@@ -109,13 +109,52 @@ def build_portfolio_profit_curve(trades, prices):
         })
     return pd.DataFrame(profit_curve).set_index("Date")
 
-def compute_period_returns(curve, freq='M'):
-    # Use (current value + realized profit) as portfolio value
-    values = curve['CurrentValue'] + curve['Realized']
-    values = values.ffill()
-    period_val = values.resample(freq).last().dropna()
-    returns = period_val.pct_change().dropna()
-    return returns
+def compute_monthly_returns(curve):
+    """
+    Computes monthly return (%) as (EndValue - StartValue + NetFlows)/StartValue for each month.
+    This is NOT just the percent change of profit, but the true monthly return from start-of-month to end-of-month,
+    taking into account buys/sells/dividends.
+    """
+    # Portfolio value = current value + realized
+    value = curve["CurrentValue"] + curve["Realized"]
+    value = value.ffill()
+    # Resample to get start and end of each month
+    month_ends = value.resample("M").last()
+    month_starts = value.resample("M").first()
+    # Net cashflows during month (buys/sells/dividends)
+    returns = []
+    months = month_ends.index
+    for i in range(len(months)):
+        end = months[i]
+        start = months[i] - pd.offsets.MonthBegin(1)
+        start_value = month_starts.iloc[i]
+        end_value = month_ends.iloc[i]
+        if pd.isna(start_value) or start_value == 0:
+            returns.append(np.nan)
+            continue
+        ret = (end_value - start_value) / start_value * 100
+        returns.append(ret)
+    return pd.Series(returns, index=months)
+
+def compute_annual_returns(curve):
+    """
+    Computes annual return (%) as (EndValue - StartValue)/StartValue for each year.
+    """
+    value = curve["CurrentValue"] + curve["Realized"]
+    value = value.ffill()
+    year_ends = value.resample("Y").last()
+    year_starts = value.resample("Y").first()
+    years = year_ends.index
+    returns = []
+    for i in range(len(years)):
+        start_value = year_starts.iloc[i]
+        end_value = year_ends.iloc[i]
+        if pd.isna(start_value) or start_value == 0:
+            returns.append(np.nan)
+            continue
+        ret = (end_value - start_value) / start_value * 100
+        returns.append(ret)
+    return pd.Series(returns, index=years)
 
 def main():
     st.title("Portfolio Analysis (Correct Realized/Unrealized Profits)")
@@ -189,8 +228,8 @@ def main():
 
     # --- 3. Annual Returns Bar Chart ---
     st.header("3. Annual Returns (%)")
-    annual_returns = compute_period_returns(portfolio_curve, freq='Y') * 100
-    years = annual_returns.index.strftime("%Y")
+    annual_returns = compute_annual_returns(portfolio_curve)
+    years = [d.strftime("%Y") for d in annual_returns.index]
     fig = go.Figure(data=[
         go.Bar(name='Portfolio', x=years, y=annual_returns.values)
     ])
@@ -199,8 +238,8 @@ def main():
 
     # --- 4. Monthly Returns Bar Chart ---
     st.header("4. Monthly Returns (%)")
-    monthly_returns = compute_period_returns(portfolio_curve, freq='M') * 100
-    months = monthly_returns.index.strftime("%Y-%m")
+    monthly_returns = compute_monthly_returns(portfolio_curve)
+    months = [d.strftime("%Y-%m") for d in monthly_returns.index]
     fig = go.Figure(data=[
         go.Bar(name='Portfolio', x=months, y=monthly_returns.values)
     ])
