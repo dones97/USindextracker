@@ -36,6 +36,20 @@ def preprocess_trades(df):
 def get_symbol_list(df):
     return df["Symbol"].unique()
 
+def get_symbol_name_map(df):
+    # Try to get a descriptive fund name for each symbol
+    # If there's a 'Description' or 'Fund Name' column, use that; else fallback to symbol
+    name_col = None
+    for col in ["Description", "Fund Name", "Security Description", "Name"]:
+        if col in df.columns:
+            name_col = col
+            break
+    if name_col:
+        name_map = df.groupby("Symbol")[name_col].agg(lambda x: x.value_counts().idxmax()).to_dict()
+    else:
+        name_map = {s: s for s in df["Symbol"].unique()}
+    return name_map
+
 def get_price_history(symbol, start, end):
     px = yf.download(symbol, start=start, end=end, progress=False)
     close_px = px["Close"].dropna()
@@ -44,11 +58,9 @@ def get_price_history(symbol, start, end):
     return close_px
 
 def build_portfolio_profit_curve(trades, prices):
-    # --- Forward fill prices for all calendar days ---
     prices = prices[~prices.index.duplicated(keep='last')]
     prices = prices.sort_index()
     all_days = pd.date_range(prices.index.min(), prices.index.max(), freq='D')
-    # Forward-fill prices for weekends/holidays
     ff_prices = prices.reindex(all_days).ffill()
     trades = trades.sort_values('Run Date')
     trades = trades.set_index('Run Date')
@@ -57,7 +69,6 @@ def build_portfolio_profit_curve(trades, prices):
     realized_profits = []  # (date, realized profit from sells/dividends)
     profit_curve = []
     for date in all_days:
-        # Process all trades for this date
         if date in trades.index:
             for _, row in trades.loc[[date]].iterrows():
                 qty = row["Quantity"]
@@ -84,8 +95,6 @@ def build_portfolio_profit_curve(trades, prices):
                     realized_profits.append((date, profit))
                 elif "DIVIDEND" in row["Action"]:
                     realized_profits.append((date, amt))
-
-        # --- Robust price extraction ---
         price_val = ff_prices.loc[date]
         if isinstance(price_val, pd.Series):
             price_val = price_val.iloc[-1]
@@ -110,23 +119,14 @@ def build_portfolio_profit_curve(trades, prices):
     return pd.DataFrame(profit_curve).set_index("Date")
 
 def compute_monthly_returns(curve):
-    """
-    Computes monthly return (%) as (EndValue - StartValue + NetFlows)/StartValue for each month.
-    This is NOT just the percent change of profit, but the true monthly return from start-of-month to end-of-month,
-    taking into account buys/sells/dividends.
-    """
-    # Portfolio value = current value + realized
     value = curve["CurrentValue"] + curve["Realized"]
     value = value.ffill()
-    # Resample to get start and end of each month
     month_ends = value.resample("M").last()
     month_starts = value.resample("M").first()
-    # Net cashflows during month (buys/sells/dividends)
     returns = []
     months = month_ends.index
     for i in range(len(months)):
         end = months[i]
-        start = months[i] - pd.offsets.MonthBegin(1)
         start_value = month_starts.iloc[i]
         end_value = month_ends.iloc[i]
         if pd.isna(start_value) or start_value == 0:
@@ -137,9 +137,6 @@ def compute_monthly_returns(curve):
     return pd.Series(returns, index=months)
 
 def compute_annual_returns(curve):
-    """
-    Computes annual return (%) as (EndValue - StartValue)/StartValue for each year.
-    """
     value = curve["CurrentValue"] + curve["Realized"]
     value = value.ffill()
     year_ends = value.resample("Y").last()
@@ -157,7 +154,7 @@ def compute_annual_returns(curve):
     return pd.Series(returns, index=years)
 
 def main():
-    st.title("Index Fund Portfolio Analysis")
+    st.title("Portfolio Analysis (Correct Realized/Unrealized Profits)")
 
     uploaded_files = st.file_uploader(
         "Upload one or more files (Excel/CSV) from Fidelity.",
@@ -172,6 +169,8 @@ def main():
     df = read_uploaded_files(uploaded_files)
     df = preprocess_trades(df)
     symbols = get_symbol_list(df)
+    # --- Fund name lookup ---
+    symbol_name_map = get_symbol_name_map(df)
     t0 = df["Run Date"].min() - pd.Timedelta(days=5)
     t1 = datetime.today()
 
@@ -219,35 +218,8 @@ def main():
     st.write(f"**Total Return (%):** {total_return_pct:.2%}")
     st.write(f"**Total Profit ($):** {total_profit:,.2f}")
 
-    # --- 2. Cumulative Profit Chart ---
-    st.header("2. Portfolio Cumulative Profits")
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=portfolio_curve.index, y=portfolio_curve["TotalProfit"], mode='lines', name="Cumulative Profit"))
-    fig.update_layout(title="Cumulative Profits", yaxis_title="Profit ($)", xaxis_title="Date")
-    st.plotly_chart(fig, use_container_width=True)
-
-    # --- 3. Annual Returns Bar Chart ---
-    st.header("3. Annual Returns (%)")
-    annual_returns = compute_annual_returns(portfolio_curve)
-    years = [d.strftime("%Y") for d in annual_returns.index]
-    fig = go.Figure(data=[
-        go.Bar(name='Portfolio', x=years, y=annual_returns.values)
-    ])
-    fig.update_layout(barmode='group', title="Annual Returns (%)", yaxis_title="Return (%)", xaxis_title="Year")
-    st.plotly_chart(fig, use_container_width=True)
-
-    # --- 4. Monthly Returns Bar Chart ---
-    st.header("4. Monthly Returns (%)")
-    monthly_returns = compute_monthly_returns(portfolio_curve)
-    months = [d.strftime("%Y-%m") for d in monthly_returns.index]
-    fig = go.Figure(data=[
-        go.Bar(name='Portfolio', x=months, y=monthly_returns.values)
-    ])
-    fig.update_layout(barmode='group', title="Monthly Returns (%)", yaxis_title="Return (%)", xaxis_title="Month")
-    st.plotly_chart(fig, use_container_width=True)
-
-    # --- 5. Symbol-level comparison & XIRR table ---
-    st.header("5. Symbol Movements (XIRR Table)")
+    # --- 2. Symbol-level comparison & XIRR table ---
+    st.header("2. Fund Movements (XIRR Table)")
     symbol_xirr = []
     symbol_total_return = []
     for symbol in symbols:
@@ -266,18 +238,50 @@ def main():
         invested = -sum([amt for date, amt in symbol_cashflows if amt < 0])
         end_value = curve['CurrentValue'].iloc[-1] + curve['Realized'].iloc[-1]
         total_ret = (end_value / invested - 1) if invested != 0 else 0
-        symbol_xirr.append((symbol, sym_xirr))
-        symbol_total_return.append((symbol, total_ret * 100))
+        # Use fund name
+        fund_name = symbol_name_map.get(symbol, symbol)
+        symbol_xirr.append((symbol, fund_name, sym_xirr))
+        symbol_total_return.append((fund_name, total_ret * 100))
 
-    sym_df = pd.DataFrame(symbol_total_return, columns=["Symbol", "TotalReturn"])
+    # Bar chart: total return % per fund
+    sym_df = pd.DataFrame(symbol_total_return, columns=["Fund Name", "TotalReturn"])
     fig = go.Figure(data=[
-        go.Bar(name='Symbol', x=sym_df["Symbol"], y=sym_df["TotalReturn"])
+        go.Bar(name='Fund', x=sym_df["Fund Name"], y=sym_df["TotalReturn"])
     ])
-    fig.update_layout(barmode='group', title="Symbol Total Return (%)", yaxis_title="Return (%)")
+    fig.update_layout(barmode='group', title="Fund Total Return (%)", yaxis_title="Return (%)")
     st.plotly_chart(fig, use_container_width=True)
 
-    table_df = pd.DataFrame(symbol_xirr, columns=["Symbol", "XIRR"])
-    st.dataframe(table_df.style.format({"XIRR": "{:.2%}"}))
+    # Data Table: XIRR per fund
+    table_df = pd.DataFrame(symbol_xirr, columns=["Symbol", "Fund Name", "XIRR"])
+    # Show only Fund Name and XIRR for clarity
+    st.dataframe(table_df[["Fund Name", "XIRR"]].style.format({"XIRR": "{:.2%}"}))
+
+    # --- 3. Portfolio Cumulative Profits ---
+    st.header("3. Portfolio Cumulative Profits")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=portfolio_curve.index, y=portfolio_curve["TotalProfit"], mode='lines', name="Cumulative Profit"))
+    fig.update_layout(title="Cumulative Profits", yaxis_title="Profit ($)", xaxis_title="Date")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # --- 4. Annual Returns Bar Chart ---
+    st.header("4. Annual Returns (%)")
+    annual_returns = compute_annual_returns(portfolio_curve)
+    years = [d.strftime("%Y") for d in annual_returns.index]
+    fig = go.Figure(data=[
+        go.Bar(name='Portfolio', x=years, y=annual_returns.values)
+    ])
+    fig.update_layout(barmode='group', title="Annual Returns (%)", yaxis_title="Return (%)", xaxis_title="Year")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # --- 5. Monthly Returns Bar Chart ---
+    st.header("5. Monthly Returns (%)")
+    monthly_returns = compute_monthly_returns(portfolio_curve)
+    months = [d.strftime("%Y-%m") for d in monthly_returns.index]
+    fig = go.Figure(data=[
+        go.Bar(name='Portfolio', x=months, y=monthly_returns.values)
+    ])
+    fig.update_layout(barmode='group', title="Monthly Returns (%)", yaxis_title="Return (%)", xaxis_title="Month")
+    st.plotly_chart(fig, use_container_width=True)
 
 if __name__ == "__main__":
     main()
