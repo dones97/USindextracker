@@ -49,8 +49,14 @@ def get_snp500_shadow(cashflows, snp_prices):
     units = 0.0
     shadow_value = []
     for date, amount in cashflows:
-        # Find closest trading date in price index
-        px_date = snp_prices.index[snp_prices.index.get_loc(date, method='ffill')]
+        # Find the closest trading date on or before the cashflow date
+        if date in snp_prices.index:
+            px_date = date
+        else:
+            possible_dates = snp_prices.index[snp_prices.index <= date]
+            if len(possible_dates) == 0:
+                continue  # skip if no price available before this date
+            px_date = possible_dates.max()
         px = snp_prices.loc[px_date]
         units += amount / px
         shadow_value.append((px_date, units * px))
