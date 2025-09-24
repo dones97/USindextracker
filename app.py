@@ -21,12 +21,15 @@ def xirr(cashflows, guess=0.1):
     except (RuntimeError, OverflowError):
         return np.nan
 
-def read_excel_files(files):
+def read_uploaded_files(files):
     dfs = []
     for file in files:
-        dfs.append(pd.read_excel(file))
-    df = pd.concat(dfs, ignore_index=True)
-    return df
+        if file.name.endswith('.csv'):
+            df = pd.read_csv(file)
+        else:
+            df = pd.read_excel(file)
+        dfs.append(df)
+    return pd.concat(dfs, ignore_index=True)
 
 def preprocess_trades(df):
     # Standardize column names
@@ -76,19 +79,20 @@ def calculate_annual_returns(price_df):
 
 def plot_cumulative_returns(prices, label):
     cum_ret = (prices / prices.iloc[0]) - 1
-    st.line_chart(cum_ret.rename(label))
+    cum_ret.name = label  # Properly set Series name
+    st.line_chart(cum_ret)
 
 def main():
     st.title("Fidelity Index Fund Returns Tracker & S&P500 Comparison")
 
     uploaded_files = st.file_uploader(
-        "Upload one or more Excel files exported from Fidelity (buy/sell/dividend trades).",
-        type=["xls", "xlsx"],
+        "Upload one or more Excel or CSV files exported from Fidelity (buy/sell/dividend trades).",
+        type=["xls", "xlsx", "csv"],
         accept_multiple_files=True
     )
 
     if uploaded_files:
-        df = read_excel_files(uploaded_files)
+        df = read_uploaded_files(uploaded_files)
         df = preprocess_trades(df)
         st.write("Combined Trade Data", df.head())
 
