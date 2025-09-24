@@ -38,7 +38,11 @@ def get_symbol_list(df):
 
 def get_price_history(symbol, start, end):
     px = yf.download(symbol, start=start, end=end)
-    return px["Close"].dropna()
+    close_px = px["Close"].dropna()
+    # Defensive: remove duplicate dates
+    close_px = close_px[~close_px.index.duplicated(keep='last')]
+    close_px = close_px.sort_index()
+    return close_px
 
 def get_cashflows_for_xirr(trades, prices, end_date):
     cf = []
@@ -58,6 +62,8 @@ def get_cashflows_for_xirr(trades, prices, end_date):
     return cf
 
 def get_portfolio_value_curve(df, prices):
+    prices = prices[~prices.index.duplicated(keep='last')]
+    prices = prices.sort_index()
     all_days = pd.date_range(prices.index.min(), prices.index.max(), freq='D')
     trades = df.sort_values('Run Date').set_index('Run Date')
     qty = 0
@@ -81,7 +87,10 @@ def get_portfolio_value_curve(df, prices):
                     qty -= sell_qty
                 elif "DIVIDEND" in row["Action"]:
                     realized += amt
-        mkt_val = prices.loc[date] * qty if date in prices.index else np.nan
+        if date in prices.index:
+            mkt_val = float(prices.loc[date]) * qty
+        else:
+            mkt_val = np.nan
         value_curve.append({
             "Date": date,
             "PortfolioValue": mkt_val + realized if not np.isnan(mkt_val) else np.nan,
@@ -92,6 +101,8 @@ def get_portfolio_value_curve(df, prices):
     return pd.DataFrame(value_curve).set_index("Date")
 
 def get_sp500_shadow_value_curve(trades, sp500_prices):
+    sp500_prices = sp500_prices[~sp500_prices.index.duplicated(keep='last')]
+    sp500_prices = sp500_prices.sort_index()
     all_days = pd.date_range(sp500_prices.index.min(), sp500_prices.index.max(), freq='D')
     trades = trades.sort_values('Run Date').set_index('Run Date')
     units = 0.0
@@ -108,7 +119,10 @@ def get_sp500_shadow_value_curve(trades, sp500_prices):
                     units -= row["Quantity"]
                 elif "DIVIDEND" in row["Action"]:
                     realized += amt
-        mkt_val = float(sp500_prices.loc[date]) * float(units) if date in sp500_prices.index else np.nan
+        if date in sp500_prices.index:
+            mkt_val = float(sp500_prices.loc[date]) * float(units)
+        else:
+            mkt_val = np.nan
         value_curve.append({
             "Date": date,
             "S&P500Value": mkt_val + realized if not np.isnan(mkt_val) else np.nan
@@ -139,7 +153,6 @@ def main():
     t0 = df["Run Date"].min() - pd.Timedelta(days=5)
     t1 = datetime.today()
 
-    # --- 1. Portfolio Level Metrics ---
     st.header("1. Portfolio-level Metrics")
 
     all_prices = {}
@@ -155,7 +168,6 @@ def main():
     cf_all = sorted(cf_all, key=lambda x: x[0])
     cf_all_scalar = [(d, float(a)) for d, a in cf_all]
 
-    # S&P500 shadow XIRR: same cashflows, but applied to S&P500, final sale at last price
     cf_sp500 = []
     units = 0.0
     for date, amt in cf_all_scalar:
@@ -197,7 +209,6 @@ def main():
     st.write(f"**Total Return (%):** {total_return_pct:.2%}")
     st.write(f"**Total Profit ($):** {total_profit:,.2f}")
 
-    # --- 2. Cumulative Profits ($) vs S&P500 ---
     st.header("2. Portfolio Cumulative Profits vs S&P500")
     base_invested = -sum([float(amt) for date, amt in cf_all_scalar if amt < 0])
     plot_df = pd.DataFrame({
@@ -210,7 +221,6 @@ def main():
     fig.update_layout(title="Cumulative Profits: Portfolio vs S&P500", yaxis_title="Profit ($)", xaxis_title="Date")
     st.plotly_chart(fig, use_container_width=True)
 
-    # --- 3. Annual Returns Bar Chart ---
     st.header("3. Annual Returns (%)")
     annual_returns = port_val_df["PortfolioValue"].resample('Y').last().pct_change().dropna() * 100
     sp500_annual = sp500_val_curve["S&P500Value"].resample('Y').last().pct_change().dropna() * 100
@@ -223,7 +233,6 @@ def main():
     fig.update_layout(barmode='group', title="Annual Returns (%)", yaxis_title="Return (%)", xaxis_title="Year")
     st.plotly_chart(fig, use_container_width=True)
 
-    # --- 4. Monthly Returns Bar Chart ---
     st.header("4. Monthly Returns (%)")
     monthly_returns = port_val_df["PortfolioValue"].resample('M').last().pct_change().dropna() * 100
     sp500_monthly = sp500_val_curve["S&P500Value"].resample('M').last().pct_change().dropna() * 100
@@ -236,7 +245,6 @@ def main():
     fig.update_layout(barmode='group', title="Monthly Returns (%)", yaxis_title="Return (%)", xaxis_title="Month")
     st.plotly_chart(fig, use_container_width=True)
 
-    # --- 5. Symbol-level comparison & XIRR table ---
     st.header("5. Symbol Movements vs S&P500 (XIRR Table)")
     symbol_xirr = []
     symbol_total_return = []
