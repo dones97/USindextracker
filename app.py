@@ -85,7 +85,15 @@ def build_portfolio_profit_curve(trades, prices):
                 elif "DIVIDEND" in row["Action"]:
                     realized_profits.append((date, amt))
 
-        px = float(ff_prices.loc[date]) if not np.isnan(ff_prices.loc[date]) else np.nan
+        # --- Robust price extraction ---
+        price_val = ff_prices.loc[date]
+        if isinstance(price_val, pd.Series):
+            price_val = price_val.iloc[-1]
+        try:
+            px = float(price_val)
+        except Exception:
+            px = np.nan
+
         unrealized = 0.0
         for lot in lots:
             unrealized += (px - lot["cost"]) * lot["qty"] if not np.isnan(px) else 0.0
