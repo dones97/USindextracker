@@ -6,14 +6,11 @@ from datetime import datetime, timedelta
 from scipy.optimize import newton
 import plotly.graph_objs as go
 
-# ---------- Helper Functions ----------
-
 def xnpv(rate, cashflows):
     t0 = cashflows[0][0]
     return sum([cf / (1 + rate) ** ((t - t0).days / 365) for t, cf in cashflows])
 
 def xirr(cashflows):
-    # cashflows: list of (date, amount)
     try:
         return newton(lambda r: xnpv(r, cashflows), 0.1)
     except Exception:
@@ -44,7 +41,6 @@ def get_price_history(symbol, start, end):
     return px["Close"].dropna()
 
 def get_cashflows_for_xirr(trades, prices, end_date):
-    # Returns list of (date, amount) with final sell at end_date at market price for remaining qty
     cf = []
     qty = 0
     for _, row in trades.iterrows():
@@ -58,11 +54,10 @@ def get_cashflows_for_xirr(trades, prices, end_date):
         elif "DIVIDEND" in row["Action"]:
             cf.append((row["Run Date"], amt))
     if qty > 0 and end_date in prices.index:
-        cf.append((end_date, float(qty * prices.loc[end_date])))
+        cf.append((end_date, float(qty * float(prices.loc[end_date]))))
     return cf
 
 def get_portfolio_value_curve(df, prices):
-    # Returns portfolio value (market value + realized) each day
     all_days = pd.date_range(prices.index.min(), prices.index.max(), freq='D')
     trades = df.sort_values('Run Date').set_index('Run Date')
     qty = 0
@@ -97,7 +92,6 @@ def get_portfolio_value_curve(df, prices):
     return pd.DataFrame(value_curve).set_index("Date")
 
 def get_sp500_shadow_value_curve(trades, sp500_prices):
-    # Simulate same cash flows in S&P500, using $ amounts per trade
     all_days = pd.date_range(sp500_prices.index.min(), sp500_prices.index.max(), freq='D')
     trades = trades.sort_values('Run Date').set_index('Run Date')
     units = 0.0
@@ -107,14 +101,14 @@ def get_sp500_shadow_value_curve(trades, sp500_prices):
         if date in trades.index and date in sp500_prices.index:
             for _, row in trades.loc[[date]].iterrows():
                 amt = float(row["Amount ($)"])
-                px = sp500_prices.loc[date]
+                px = float(sp500_prices.loc[date])
                 if "YOU BOU" in row["Action"]:
                     units += abs(amt) / px
                 elif "YOU SOLD" in row["Action"]:
-                    units -= row["Quantity"]  # Sell equivalent units as original fund
+                    units -= row["Quantity"]
                 elif "DIVIDEND" in row["Action"]:
                     realized += amt
-        mkt_val = sp500_prices.loc[date] * units if date in sp500_prices.index else np.nan
+        mkt_val = float(sp500_prices.loc[date]) * float(units) if date in sp500_prices.index else np.nan
         value_curve.append({
             "Date": date,
             "S&P500Value": mkt_val + realized if not np.isnan(mkt_val) else np.nan
@@ -125,8 +119,6 @@ def compute_period_returns(portfolio_value, freq='M'):
     period_val = portfolio_value.resample(freq).last().dropna()
     returns = period_val.pct_change().dropna()
     return returns
-
-# ---------- Streamlit App ----------
 
 def main():
     st.title("Portfolio vs S&P500 Analysis")
@@ -150,13 +142,11 @@ def main():
     # --- 1. Portfolio Level Metrics ---
     st.header("1. Portfolio-level Metrics")
 
-    # Get all prices for all symbols
     all_prices = {}
     for symbol in symbols:
         all_prices[symbol] = get_price_history(symbol, t0, t1)
     sp500_prices = get_price_history("^GSPC", t0, t1)
 
-    # Portfolio cashflows for XIRR (all symbols combined)
     cf_all = []
     for symbol in symbols:
         trades = df[df["Symbol"] == symbol]
@@ -165,8 +155,6 @@ def main():
     cf_all = sorted(cf_all, key=lambda x: x[0])
     cf_all_scalar = [(d, float(a)) for d, a in cf_all]
 
-    xirr_portfolio = xirr(cf_all_scalar)
-
     # S&P500 shadow XIRR: same cashflows, but applied to S&P500, final sale at last price
     cf_sp500 = []
     units = 0.0
@@ -174,18 +162,19 @@ def main():
         px_idx = sp500_prices.index[sp500_prices.index <= date]
         if len(px_idx) == 0:
             continue
-        px = sp500_prices.loc[px_idx.max()]
-        if amt < 0:
-            units += abs(amt) / px
-            cf_sp500.append((date, amt))
+        px = float(sp500_prices.loc[px_idx.max()])
+        amt_float = float(amt)
+        if amt_float < 0:
+            units += abs(amt_float) / px
+            cf_sp500.append((date, amt_float))
         else:
-            cf_sp500.append((date, amt))
-    if units > 0:
-        cf_sp500.append((sp500_prices.index[-1], float(units * sp500_prices.iloc[-1])))
+            cf_sp500.append((date, amt_float))
+    units_held = float(units) if not isinstance(units, (pd.Series, np.ndarray)) else float(units.iloc[-1])
+    if units_held > 0:
+        cf_sp500.append((sp500_prices.index[-1], float(units_held * float(sp500_prices.iloc[-1]))))
     xirr_sp500 = xirr(cf_sp500)
+    xirr_portfolio = xirr(cf_all_scalar)
 
-    # Total profit and return %
-    # Build portfolio value curve by summing across all symbols
     port_val_df = None
     for symbol in symbols:
         trades = df[df["Symbol"] == symbol]
@@ -199,7 +188,7 @@ def main():
     total_end_value = port_val_df["PortfolioValue"].iloc[-1]
     total_profit = total_end_value - total_invested
     total_return_pct = (total_end_value / total_invested - 1) if total_invested != 0 else 0
-    # S&P500 shadow value curve
+
     sp500_val_curve = get_sp500_shadow_value_curve(df, sp500_prices)
     sp500_end_value = sp500_val_curve["S&P500Value"].iloc[-1]
 
@@ -225,7 +214,6 @@ def main():
     st.header("3. Annual Returns (%)")
     annual_returns = port_val_df["PortfolioValue"].resample('Y').last().pct_change().dropna() * 100
     sp500_annual = sp500_val_curve["S&P500Value"].resample('Y').last().pct_change().dropna() * 100
-    # Match years for plotting
     years = annual_returns.index.strftime("%Y")
     sp500_annual_vals = sp500_annual.reindex(annual_returns.index, fill_value=np.nan).values
     fig = go.Figure(data=[
@@ -239,7 +227,6 @@ def main():
     st.header("4. Monthly Returns (%)")
     monthly_returns = port_val_df["PortfolioValue"].resample('M').last().pct_change().dropna() * 100
     sp500_monthly = sp500_val_curve["S&P500Value"].resample('M').last().pct_change().dropna() * 100
-    # Match months for plotting
     months = monthly_returns.index.strftime("%Y-%m")
     sp500_monthly_vals = sp500_monthly.reindex(monthly_returns.index, fill_value=np.nan).values
     fig = go.Figure(data=[
@@ -259,21 +246,20 @@ def main():
         cf = get_cashflows_for_xirr(trades, px, px.index[-1])
         cf_scalar = [(d, float(a)) for d, a in cf]
         sym_xirr = xirr(cf_scalar)
-        # S&P500 for this symbol: use same cashflows but apply to S&P500
         cf_sp = []
         units = 0.0
         for date, amt in cf_scalar:
             px_idx = sp500_prices.index[sp500_prices.index <= date]
             if len(px_idx) == 0:
                 continue
-            px_sp = sp500_prices.loc[px_idx.max()]
+            px_sp = float(sp500_prices.loc[px_idx.max()])
             if amt < 0:
                 units += abs(amt) / px_sp
             cf_sp.append((date, amt))
-        if units > 0:
-            cf_sp.append((sp500_prices.index[-1], float(units * sp500_prices.iloc[-1])))
+        units_held = float(units) if not isinstance(units, (pd.Series, np.ndarray)) else float(units.iloc[-1])
+        if units_held > 0:
+            cf_sp.append((sp500_prices.index[-1], float(units_held * float(sp500_prices.iloc[-1]))))
         sym_xirr_sp = xirr(cf_sp)
-        # Total return %
         invested = -sum([float(amt) for d, amt in cf_scalar if amt < 0])
         qty_held = 0
         for _, row in trades.iterrows():
@@ -286,9 +272,7 @@ def main():
         symbol_xirr.append((symbol, sym_xirr, sym_xirr_sp))
         symbol_total_return.append((symbol, total_ret * 100))
 
-    # Bar chart: total return % per symbol vs S&P500
     sym_df = pd.DataFrame(symbol_total_return, columns=["Symbol", "TotalReturn"])
-    # Use the actual S&P500 shadow return for the portfolio for comparison; could also calculate per symbol, but this is clearer
     sp500_return = (sp500_end_value / total_invested - 1) * 100 if total_invested != 0 else 0
     fig = go.Figure(data=[
         go.Bar(name='Symbol', x=sym_df["Symbol"], y=sym_df["TotalReturn"]),
@@ -297,7 +281,6 @@ def main():
     fig.update_layout(barmode='group', title="Symbol Total Return (%) vs S&P500", yaxis_title="Return (%)")
     st.plotly_chart(fig, use_container_width=True)
 
-    # Data Table: XIRR per symbol and S&P500
     table_df = pd.DataFrame(symbol_xirr, columns=["Symbol", "XIRR", "S&P500 XIRR"])
     st.dataframe(table_df.style.format({"XIRR": "{:.2%}", "S&P500 XIRR": "{:.2%}"}))
 
