@@ -157,7 +157,7 @@ def compute_annual_returns(curve):
     return pd.Series(returns, index=years)
 
 def main():
-    st.title("Portfolio Analysis (Correct Realized/Unrealized Profits)")
+    st.title("Index Fund Portfolio Analysis")
 
     uploaded_files = st.file_uploader(
         "Upload one or more files (Excel/CSV) from Fidelity.",
