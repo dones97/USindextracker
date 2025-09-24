@@ -132,8 +132,9 @@ def main():
         price_hist = yf.download(main_symbol, start=start, end=end)["Close"].dropna()
         # Mark-to-market: calculate cumulative profit
         # For demo, we just use running sum of cashflows (not actual holding value)
-        cf_df = pd.DataFrame(cashflows, columns=["date", "amount"]).set_index("date")
-        cf_df = cf_df.reindex(price_hist.index, method="ffill").fillna(0)
+        cf_df = pd.DataFrame(cashflows, columns=["date", "amount"])
+        cf_df = cf_df.groupby("date").sum()  # Aggregate cashflows per date
+        cf_df = cf_df.reindex(price_hist.index, fill_value=0)  # No more duplicates
         cum_profit = cf_df["amount"].cumsum()
 
         # S&P500 shadow
