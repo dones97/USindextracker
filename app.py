@@ -215,10 +215,11 @@ def main():
     st.header("1. Portfolio-level Metrics")
     end_date = portfolio_curve.index[-1]
     values_for_xirr = portfolio_curve['CurrentValue'].iloc[-1]
-    cashflows = []
-    for _, row in df.iterrows():
-        amt = float(row["Amount ($)"])
-        cashflows.append((row["Run Date"], amt))
+
+    # Aggregate all cashflows by date for portfolio-level XIRR
+    df['Amount ($)'] = df['Amount ($)'].astype(float)
+    portfolio_cashflows_df = df.groupby("Run Date")["Amount ($)"].sum().reset_index()
+    cashflows = [(row["Run Date"], row["Amount ($)"]) for _, row in portfolio_cashflows_df.iterrows()]
     if values_for_xirr > 0:
         cashflows.append((end_date, values_for_xirr))
     xirr_portfolio = xirr(cashflows)
