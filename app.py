@@ -58,6 +58,10 @@ def get_price_history(symbol, start, end):
     return close_px
 
 def build_portfolio_profit_curve(trades, prices):
+    # Check if prices is empty or has no valid dates
+    if prices.empty or prices.index.isna().all():
+        return pd.DataFrame(columns=['Unrealized', 'Realized', 'TotalProfit', 'CurrentValue', 'CurrentQty'])
+    
     prices = prices[~prices.index.duplicated(keep='last')]
     prices = prices.sort_index()
     all_days = pd.date_range(prices.index.min(), prices.index.max(), freq='D')
@@ -189,16 +193,30 @@ def main():
 
     # Get price history for all symbols
     all_prices = {}
+    failed_symbols = []
     for symbol in symbols:
-        all_prices[symbol] = get_price_history(symbol, t0, t1)
+        prices = get_price_history(symbol, t0, t1)
+        if prices.empty:
+            failed_symbols.append(symbol)
+            st.warning(f"⚠️ Could not retrieve price data for symbol: {symbol}. This symbol will be skipped.")
+        all_prices[symbol] = prices
 
     # Build and sum profit curves for all symbols
     profit_curves = {}
     for symbol in symbols:
+        if symbol in failed_symbols:
+            continue  # Skip symbols with no price data
         trades = df[df["Symbol"] == symbol]
         prices = all_prices[symbol]
-        profit_curves[symbol] = build_portfolio_profit_curve(trades, prices)
+        curve = build_portfolio_profit_curve(trades, prices)
+        if not curve.empty:
+            profit_curves[symbol] = curve
 
+    # Check if we have any valid profit curves
+    if not profit_curves:
+        st.error("❌ No valid price data could be retrieved for any symbols. Please check that the symbols in your file are correct and try again.")
+        return
+    
     # Portfolio-level curve: sum across all symbols
     all_dates = sorted(set().union(*[curve.index for curve in profit_curves.values()]))
     portfolio_curve = pd.DataFrame(index=pd.DatetimeIndex(all_dates))
