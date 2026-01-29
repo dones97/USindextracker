@@ -26,11 +26,52 @@ def read_uploaded_files(files):
         dfs.append(df)
     return pd.concat(dfs, ignore_index=True)
 
+def classify_action(row):
+    action = str(row["Action"]).upper()
+    if "YOU BOUGHT" in action:
+        return "BUY"
+    if "YOU SOLD" in action:
+        return "SELL"
+    if "REINVESTMENT" in action:
+        return "REINVEST"
+    if "DIVIDEND" in action:
+        # Reinvestment lines often say "DIVIDEND RECEIVED" then "REINVESTMENT"? 
+        # Based on file check, "DIVIDEND RECEIVED" is separate from "REINVESTMENT"
+        # We will handle "REINVESTMENT" checks in profit curve building, 
+        # but here we just want to ID it as a dividend type if not reinvestment
+        return "DIVIDEND"
+    if "TRANSFER" in action:
+        if "RECEIVED" in action:
+            return "DEPOSIT"
+        if "PAID" in action:
+            return "WITHDRAWAL"
+    # Fallback for explicit cash movements if any (e.g. check deposits not labeled transfer)
+    if "DEPOSIT" in action: return "DEPOSIT"
+    if "WITHDRAWAL" in action: return "WITHDRAWAL"
+    return "OTHER"
+
 def preprocess_trades(df):
     df.columns = [col.strip() for col in df.columns]
     df["Run Date"] = pd.to_datetime(df["Run Date"])
-    df = df[df["Action"].notna()]
-    df = df[df["Action"].str.contains("YOU BOU|YOU SOLD|DIVIDEND", case=False, na=False)]
+    
+    # helper for amount parsing
+    def parse_amount(x):
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).replace('$', '').replace(',', '').strip()
+        if '(' in s and ')' in s:
+            s = '-' + s.replace('(', '').replace(')', '')
+        return float(s)
+        
+    if "Amount ($)" in df.columns:
+        df["Amount ($)"] = df["Amount ($)"].apply(parse_amount)
+    
+    df["ActionType"] = df.apply(classify_action, axis=1)
+    
+    # Filter to relevant types
+    relevant_types = ["BUY", "SELL", "DIVIDEND", "REINVEST", "DEPOSIT", "WITHDRAWAL"]
+    df = df[df["ActionType"].isin(relevant_types)]
+    
     return df
 
 def get_symbol_list(df):
@@ -51,11 +92,33 @@ def get_symbol_name_map(df):
     return name_map
 
 def get_price_history(symbol, start, end):
-    px = yf.download(symbol, start=start, end=end, progress=False)
-    close_px = px["Close"].dropna()
-    close_px = close_px[~close_px.index.duplicated(keep='last')]
-    close_px = close_px.sort_index()
-    return close_px
+    # Special handling for Cash/Money Market
+    if symbol == "SPAXX" or symbol == "Cash":
+        # Create a dummy series of 1.0
+        dates = pd.date_range(start, end, freq='D')
+        return pd.Series(1.0, index=dates)
+        
+    try:
+        px = yf.download(symbol, start=start, end=end, progress=False)
+        if px.empty: 
+            return pd.Series()
+        
+        # yfinance might return multi-index columns if only 1 ticker but formatted that way
+        if "Close" in px.columns:
+            close_px = px["Close"]
+        else:
+            return pd.Series()
+            
+        # If it's a DataFrame (multi-symbol or check), squeeze it
+        if isinstance(close_px, pd.DataFrame):
+            close_px = close_px.iloc[:, 0]
+            
+        close_px = close_px.dropna()
+        close_px = close_px[~close_px.index.duplicated(keep='last')]
+        close_px = close_px.sort_index()
+        return close_px
+    except Exception:
+        return pd.Series()
 
 def build_portfolio_profit_curve(trades, prices):
     # Check if prices is empty or has no valid dates
@@ -64,6 +127,10 @@ def build_portfolio_profit_curve(trades, prices):
     
     prices = prices[~prices.index.duplicated(keep='last')]
     prices = prices.sort_index()
+    
+    if prices.empty:
+         return pd.DataFrame(columns=['Unrealized', 'Realized', 'TotalProfit', 'CurrentValue', 'CurrentQty'])
+
     all_days = pd.date_range(prices.index.min(), prices.index.max(), freq='D')
     ff_prices = prices.reindex(all_days).ffill()
     trades = trades.sort_values('Run Date')
@@ -72,54 +139,106 @@ def build_portfolio_profit_curve(trades, prices):
     lots = []
     realized_profits = []  # (date, realized profit from sells/dividends)
     profit_curve = []
+    
+    # Track accumulated cashflows for this symbol (Internal Rate of Return perspective)
+    # Cash In: Cost of Buys. Cash Out: Proceeds of Sells + Dividends.
+    cum_cash_in = 0.0
+    cum_cash_out = 0.0
+    
     for date in all_days:
         if date in trades.index:
-            for _, row in trades.loc[[date]].iterrows():
+            # Handle multiple trades on same day
+            day_trades = trades.loc[[date]]
+            for _, row in day_trades.iterrows():
                 qty = row["Quantity"]
                 amt = float(row["Amount ($)"])
-                if "YOU BOU" in row["Action"]:
-                    price = float(row["Price ($)"])
-                    lots.append({"qty": qty, "cost": price})
-                elif "YOU SOLD" in row["Action"]:
-                    sell_qty = qty
-                    sell_price = float(row["Price ($)"])
-                    profit = 0
-                    while sell_qty > 0 and lots:
+                atype = row["ActionType"]
+                
+                # PRICE handling:
+                # Some rows might imply price = Amount/Qty if Price is missing/zero
+                # But usually Price column is there.
+                trade_price = float(row["Price ($)"]) if pd.notna(row["Price ($)"]) and row["Price ($)"] != 0 else 0
+                if trade_price == 0 and qty != 0:
+                     trade_price = abs(amt / qty)
+
+                if atype == "BUY" or atype == "REINVEST":
+                    # For REINVEST, it's effectively a BUY.
+                    # The Income aspect of Reinvest is handled by the DIVIDEND row usually present.
+                    # If strictly one row "Dividend Reinvestment", then we count it as both Income and Buy?
+                    # Safer assumption: Treat REINVEST as BUY. The DIVIDEND row handles the profit realization.
+                    lots.append({"qty": qty, "cost": trade_price})
+                    cost_basis = qty * trade_price
+                    cum_cash_in += cost_basis
+                    
+                elif atype == "SELL":
+                    sell_qty = abs(qty) # Ensure positive
+                    sell_price = trade_price
+                    
+                    # Logic: FIFO
+                    profit_from_sale = 0
+                    cost_of_sold = 0
+                    
+                    remaining_to_sell = sell_qty
+                    while remaining_to_sell > 0 and lots:
                         lot = lots[0]
-                        lot_qty = lot["qty"]
-                        lot_cost = lot["cost"]
-                        if lot_qty <= sell_qty:
-                            this_qty = lot_qty
+                        if lot["qty"] <= remaining_to_sell:
+                            # Consume entire lot
+                            profit_from_sale += (sell_price - lot["cost"]) * lot["qty"]
+                            cost_of_sold += lot["cost"] * lot["qty"]
+                            remaining_to_sell -= lot["qty"]
                             lots.pop(0)
                         else:
-                            this_qty = sell_qty
-                            lot["qty"] -= sell_qty
-                        profit += (sell_price - lot_cost) * this_qty
-                        sell_qty -= this_qty
-                    realized_profits.append((date, profit))
-                elif "DIVIDEND" in row["Action"]:
+                            # Partial lot
+                            profit_from_sale += (sell_price - lot["cost"]) * remaining_to_sell
+                            cost_of_sold += lot["cost"] * remaining_to_sell
+                            lot["qty"] -= remaining_to_sell
+                            remaining_to_sell = 0
+                            
+                    realized_profits.append((date, profit_from_sale))
+                    cum_cash_out += (cost_of_sold + profit_from_sale) # This equals Proceeds
+                    
+                elif atype == "DIVIDEND":
                     realized_profits.append((date, amt))
+                    cum_cash_out += amt
+
+        # Daily Valuation
         price_val = ff_prices.loc[date]
         if isinstance(price_val, pd.Series):
             price_val = price_val.iloc[-1]
+        
         try:
             px = float(price_val)
         except Exception:
             px = np.nan
 
-        unrealized = 0.0
-        for lot in lots:
-            unrealized += (px - lot["cost"]) * lot["qty"] if not np.isnan(px) else 0.0
-        realized = sum([p for d, p in realized_profits if d <= date])
-        cumulative = realized + unrealized
+        current_qty = sum([lot["qty"] for lot in lots])
+        
+        # Helper for NaN price
+        val_px = 0.0 if np.isnan(px) else px
+        
+        # Calculate Metrics
+        current_value = current_qty * val_px
+        cost_basis_held = sum([lot["qty"] * lot["cost"] for lot in lots])
+        
+        unrealized = current_value - cost_basis_held if not np.isnan(px) else 0.0
+        
+        # Realized is cumulative sum of realized events
+        cum_realized = sum([p for d, p in realized_profits if d <= date])
+        
+        # Total Profit = Realized + Unrealized
+        # Alternative: MarketValue + CashOut - CashIn
+        # Let's use Realized + Unrealized as it is cleaner for display
+        total_profit = cum_realized + unrealized
+
         profit_curve.append({
             "Date": date,
             "Unrealized": unrealized,
-            "Realized": realized,
-            "TotalProfit": cumulative,
-            "CurrentValue": sum([lot["qty"] for lot in lots]) * px if not np.isnan(px) else np.nan,
-            "CurrentQty": sum([lot["qty"] for lot in lots])
+            "Realized": cum_realized,
+            "TotalProfit": total_profit,
+            "CurrentValue": current_value,
+            "CurrentQty": current_qty
         })
+        
     return pd.DataFrame(profit_curve).set_index("Date")
 
 def compute_monthly_returns(curve):
@@ -232,23 +351,49 @@ def main():
     # --- 1. Portfolio Level Metrics ---
     st.header("1. Portfolio-level Metrics")
     end_date = portfolio_curve.index[-1]
-    values_for_xirr = portfolio_curve['CurrentValue'].iloc[-1]
+    current_portfolio_value = portfolio_curve['CurrentValue'].iloc[-1]
 
-    # Aggregate all cashflows by date for portfolio-level XIRR
-    df['Amount ($)'] = df['Amount ($)'].astype(float)
-    portfolio_cashflows_df = df.groupby("Run Date")["Amount ($)"].sum().reset_index()
-    cashflows = [(row["Run Date"], row["Amount ($)"]) for _, row in portfolio_cashflows_df.iterrows()]
-    if values_for_xirr > 0:
-        cashflows.append((end_date, values_for_xirr))
-    xirr_portfolio = xirr(cashflows)
-    total_invested = -sum([amt for date, amt in cashflows if amt < 0])
-    total_end_value = values_for_xirr + portfolio_curve["Realized"].iloc[-1]
-    total_profit = total_end_value - total_invested
-    total_return_pct = (total_end_value / total_invested - 1) if total_invested != 0 else 0
+    # Calculate Net Invested and Portfolio XIRR using External Flows (Deposits/Withdrawals)
+    # Filter for external flows
+    ext_flows = df[df["ActionType"].isin(["DEPOSIT", "WITHDRAWAL"])].copy()
+    
+    # Sign convention for XIRR:
+    # Deposits (Investments) -> Negative
+    # Withdrawals (Returns) -> Positive
+    # Final Value -> Positive
+    
+    xirr_flows = []
+    net_invested = 0.0
+    
+    for _, row in ext_flows.iterrows():
+        dt = row["Run Date"]
+        amt = row["Amount ($)"]
+        atype = row["ActionType"]
+        
+        # In file, Deposit is Positive, Withdrawal is Negative (usually).
+        # Check signs. Assuming Dep +, With -
+        if atype == "DEPOSIT":
+             # For XIRR: Negative flow (money going in)
+             xirr_flows.append((dt, -1 * abs(amt)))
+             net_invested += abs(amt)
+        elif atype == "WITHDRAWAL":
+             # For XIRR: Positive flow (money coming out)
+             xirr_flows.append((dt, abs(amt))) # File has negative, so abs() is positive
+             net_invested -= abs(amt) # Reduces net invested
+             
+    # Append Final Value
+    xirr_flows.append((end_date, current_portfolio_value))
+    
+    xirr_portfolio = xirr(xirr_flows)
+    
+    total_profit = current_portfolio_value - net_invested
+    total_return_pct = (total_profit / net_invested) if net_invested != 0 else 0
 
     st.write(f"**Portfolio XIRR:** {xirr_portfolio:.2%}")
     st.write(f"**Total Return (%):** {total_return_pct:.2%}")
     st.write(f"**Total Profit ($):** {total_profit:,.2f}")
+    
+    st.info(f"debug: Net Invested: ${net_invested:,.2f}, Current Value: ${current_portfolio_value:,.2f}")
 
     # --- 2. Symbol-level comparison & XIRR table ---
     st.header("2. Fund Movements (XIRR Table)")
@@ -267,9 +412,31 @@ def main():
         if symbol_value > 0:
             symbol_cashflows.append((end_date, symbol_value))
         sym_xirr = xirr(symbol_cashflows)
-        invested = -sum([amt for date, amt in symbol_cashflows if amt < 0])
-        end_value = curve['CurrentValue'].iloc[-1] + curve['Realized'].iloc[-1]
-        total_ret = (end_value / invested - 1) if invested != 0 else 0
+        
+        # Simple Return for Symbol: (Value + CashOut) / CashIn - 1?
+        # Or just (Profit / CashIn)
+        # CashIn = Cost of Buys
+        cash_in = sum([abs(row["Amount ($)"]) for _, row in trades.iterrows() if row["ActionType"] in ["BUY", "REINVEST"] and row["Amount ($)"] < 0]) 
+        # Note: BUY amount usually negative in file?
+        # Let's be careful. If preprocess_trades didn't enforce sign, we check.
+        # User file inspection: BUY -Amount? No, typically "Amount" is cost.
+        # Let's rely on 'amount' being negative for money spent if we didn't force it?
+        # In preprocess: we strip $ and ().
+        # Let's Assume: BUY cost is implied by Quantity * Price?
+        # Better: use logic from profit curve building (Cost Basis)
+        
+        # Let's grab cumulative profit from curve
+        sym_profit = curve['TotalProfit'].iloc[-1]
+        
+        # Invested estimate: Current Cost Basis? No, that misses sold items.
+        # Sum of all BUYS cost.
+        buy_rows = trades[trades["ActionType"].isin(["BUY", "REINVEST"])]
+        # Cost is roughly sum of amounts (since file likely has negative amounts for buys or we treat them as cost)
+        # Actually in file "Amount ($)" for BUY is usually negative.
+        # Let's sum abs(Amount) for BUYs.
+        invested = buy_rows["Amount ($)"].abs().sum()
+        
+        total_ret = (sym_profit / invested) if invested != 0 else 0
         fund_name = symbol_name_map.get(symbol, symbol)
         symbol_xirr.append((symbol, fund_name, sym_xirr))
         symbol_total_return.append((fund_name, total_ret * 100))
