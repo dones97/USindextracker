@@ -52,7 +52,7 @@ def classify_action(row):
 
 def preprocess_trades(df):
     df.columns = [col.strip() for col in df.columns]
-    df["Run Date"] = pd.to_datetime(df["Run Date"])
+    df["Run Date"] = pd.to_datetime(df["Run Date"]).dt.normalize()
     
     # helper for amount parsing
     def parse_amount(x):
@@ -61,6 +61,7 @@ def preprocess_trades(df):
         s = str(x).replace('$', '').replace(',', '').strip()
         if '(' in s and ')' in s:
             s = '-' + s.replace('(', '').replace(')', '')
+        # Handle cases where - is at end? Or other formats?
         return float(s)
         
     if "Amount ($)" in df.columns:
@@ -75,7 +76,11 @@ def preprocess_trades(df):
     return df
 
 def get_symbol_list(df):
-    return df["Symbol"].unique()
+    syms = df["Symbol"].dropna().unique()
+    # clean strings
+    syms = [str(s).strip() for s in syms]
+    # remove empty
+    return [s for s in syms if s and s.upper() != "NAN" and s != "."]
 
 def get_symbol_name_map(df):
     # Try to get a descriptive fund name for each symbol
@@ -115,6 +120,11 @@ def get_price_history(symbol, start, end):
             
         close_px = close_px.dropna()
         close_px = close_px[~close_px.index.duplicated(keep='last')]
+        # Ensure index is timezone-naive and normalized
+        if close_px.index.tz is not None:
+             close_px.index = close_px.index.tz_localize(None)
+        close_px.index = close_px.index.normalize()
+        
         close_px = close_px.sort_index()
         return close_px
     except Exception:
@@ -399,9 +409,15 @@ def main():
     st.header("2. Fund Movements (XIRR Table)")
     symbol_xirr = []
     symbol_total_return = []
+    
+    # Sort symbols by current value (descending) for better display, or just alphabetical
+    # Using original order for now but filtered
     for symbol in symbols:
+        if symbol not in profit_curves:
+            continue
+            
         trades = df[df["Symbol"] == symbol]
-        px = all_prices[symbol]
+        # curve is guaranteed to exist now
         curve = profit_curves[symbol]
         end_date = curve.index[-1]
         symbol_value = curve['CurrentValue'].iloc[-1]
