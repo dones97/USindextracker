@@ -505,17 +505,20 @@ def main():
 
     # Bar chart: total return % per fund
     sym_df = pd.DataFrame(symbol_total_return, columns=["Fund Name", "TotalReturn"])
+    sym_df = sym_df.sort_values(by="TotalReturn", ascending=False)
     wrapped_fund_names = wrap_labels(sym_df["Fund Name"].tolist(), width=15)
+    
+    fund_labels = [f"{val:.1f}%" for val in sym_df["TotalReturn"]]
     fig = go.Figure(data=[
-        go.Bar(x=wrapped_fund_names, y=sym_df["TotalReturn"])
+        go.Bar(x=wrapped_fund_names, y=sym_df["TotalReturn"], text=fund_labels, textposition='auto')
     ])
     fig.update_layout(
         barmode='group',
         title="Fund Total Return (%)",
         yaxis_title="Return (%)",
         xaxis_title="Fund",
-        xaxis_tickangle=0,
-        margin=dict(b=120),
+        xaxis_tickangle=-90,
+        margin=dict(b=150),
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -534,20 +537,34 @@ def main():
     st.header("4. Annual Returns (%)")
     annual_returns = compute_annual_returns(portfolio_curve)
     years = [d.strftime("%Y") for d in annual_returns.index]
+    ann_labels = [f"{val:.1f}%" if pd.notna(val) else "" for val in annual_returns.values]
     fig = go.Figure(data=[
-        go.Bar(name='Portfolio', x=years, y=annual_returns.values)
+        go.Bar(name='Portfolio', x=years, y=annual_returns.values, text=ann_labels, textposition='auto')
     ])
-    fig.update_layout(barmode='group', title="Annual Returns (%)", yaxis_title="Return (%)", xaxis_title="Year")
+    fig.update_layout(
+        barmode='group', 
+        title="Annual Returns (%)", 
+        yaxis_title="Return (%)", 
+        xaxis_title="Year",
+        xaxis=dict(type='category')
+    )
     st.plotly_chart(fig, use_container_width=True)
 
     # --- 5. Monthly Returns Bar Chart ---
     st.header("5. Monthly Returns (%)")
     monthly_returns = compute_monthly_returns(portfolio_curve)
     months = [d.strftime("%Y-%m") for d in monthly_returns.index]
+    mon_labels = [f"{val:.1f}%" if pd.notna(val) else "" for val in monthly_returns.values]
     fig = go.Figure(data=[
-        go.Bar(name='Portfolio', x=months, y=monthly_returns.values)
+        go.Bar(name='Portfolio', x=months, y=monthly_returns.values, text=mon_labels, textposition='auto')
     ])
-    fig.update_layout(barmode='group', title="Monthly Returns (%)", yaxis_title="Return (%)", xaxis_title="Month")
+    fig.update_layout(
+        barmode='group', 
+        title="Monthly Returns (%)", 
+        yaxis_title="Return (%)", 
+        xaxis_title="Month",
+        xaxis=dict(type='category')
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 if __name__ == "__main__":
