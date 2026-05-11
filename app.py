@@ -109,8 +109,7 @@ def get_symbol_list(df):
     syms = df["Symbol"].dropna().unique()
     # clean strings
     syms = [str(s).strip() for s in syms]
-    # remove empty
-    return [s for s in syms if s and s.upper() != "NAN" and s != "."]
+    return [s for s in syms if s and s.upper() != "NAN" and s != "." and s.upper() not in ["SPAXX", "CASH", "FDRXX"]]
 
 def get_symbol_name_map(df):
     # Try to get a descriptive fund name for each symbol
@@ -282,37 +281,53 @@ def build_portfolio_profit_curve(trades, prices):
     return pd.DataFrame(profit_curve).set_index("Date")
 
 def compute_monthly_returns(curve):
-    value = curve["CurrentValue"] + curve["Realized"]
-    value = value.ffill()
-    month_ends = value.resample("ME").last()
-    month_starts = value.resample("ME").first()
+    month_ends = curve.resample("ME").last()
+    month_starts = curve.resample("ME").first()
     returns = []
     months = month_ends.index
     for i in range(len(months)):
-        end_value = month_ends.iloc[i]
-        start_value = month_starts.iloc[i]
-        if pd.isna(start_value) or start_value == 0:
-            returns.append(np.nan)
-            continue
-        ret = (end_value - start_value) / start_value * 100
-        returns.append(ret)
+        start_val = month_starts["CurrentValue"].iloc[i]
+        end_val = month_ends["CurrentValue"].iloc[i]
+        start_profit = month_starts["TotalProfit"].iloc[i]
+        end_profit = month_ends["TotalProfit"].iloc[i]
+        
+        profit_change = end_profit - start_profit
+        unrealized_change = month_ends["Unrealized"].iloc[i] - month_starts["Unrealized"].iloc[i]
+        net_flows = (end_val - start_val) - unrealized_change
+        
+        denom = start_val + (net_flows / 2.0)
+        if denom <= 0:
+            denom = end_val / 2.0 if end_val > 0 else 0
+            
+        if denom <= 0:
+            returns.append(0.0)
+        else:
+            returns.append((profit_change / denom) * 100)
     return pd.Series(returns, index=months)
 
 def compute_annual_returns(curve):
-    value = curve["CurrentValue"] + curve["Realized"]
-    value = value.ffill()
-    year_ends = value.resample("YE").last()
-    year_starts = value.resample("YE").first()
+    year_ends = curve.resample("YE").last()
+    year_starts = curve.resample("YE").first()
     years = year_ends.index
     returns = []
     for i in range(len(years)):
-        end_value = year_ends.iloc[i]
-        start_value = year_starts.iloc[i]
-        if pd.isna(start_value) or start_value == 0:
-            returns.append(np.nan)
-            continue
-        ret = (end_value - start_value) / start_value * 100
-        returns.append(ret)
+        start_val = year_starts["CurrentValue"].iloc[i]
+        end_val = year_ends["CurrentValue"].iloc[i]
+        start_profit = year_starts["TotalProfit"].iloc[i]
+        end_profit = year_ends["TotalProfit"].iloc[i]
+        
+        profit_change = end_profit - start_profit
+        unrealized_change = year_ends["Unrealized"].iloc[i] - year_starts["Unrealized"].iloc[i]
+        net_flows = (end_val - start_val) - unrealized_change
+        
+        denom = start_val + (net_flows / 2.0)
+        if denom <= 0:
+            denom = end_val / 2.0 if end_val > 0 else 0
+            
+        if denom <= 0:
+            returns.append(0.0)
+        else:
+            returns.append((profit_change / denom) * 100)
     return pd.Series(returns, index=years)
 
 def wrap_labels(labels, width=15):
@@ -384,7 +399,7 @@ def main():
         for col in ['Unrealized', 'Realized', 'TotalProfit', 'CurrentValue', 'CurrentQty']:
             if col not in portfolio_curve.columns:
                 portfolio_curve[col] = 0.0
-            vals = curve[col].reindex(portfolio_curve.index, fill_value=0.0)
+            vals = curve[col].reindex(portfolio_curve.index).ffill().fillna(0.0)
             portfolio_curve[col] += vals
     for col in ['CurrentValue', 'CurrentQty']:
         portfolio_curve[col] = portfolio_curve[col].replace(0, np.nan).ffill().fillna(0.0)
