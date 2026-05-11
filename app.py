@@ -5,6 +5,8 @@ import yfinance as yf
 from datetime import datetime, timedelta
 from scipy.optimize import newton
 import plotly.graph_objs as go
+import os
+import glob
 
 def xnpv(rate, cashflows):
     t0 = cashflows[0][0]
@@ -16,15 +18,36 @@ def xirr(cashflows):
     except Exception:
         return np.nan
 
-def read_uploaded_files(files):
+def load_trade_data(uploaded_files, data_dir="data"):
     dfs = []
-    for file in files:
-        if file.name.endswith('.csv'):
-            df = pd.read_csv(file)
-        else:
-            df = pd.read_excel(file)
-        dfs.append(df)
-    return pd.concat(dfs, ignore_index=True)
+    
+    # 1. Load files from the local data directory
+    if os.path.exists(data_dir):
+        for file_path in glob.glob(os.path.join(data_dir, "*.csv")):
+            dfs.append(pd.read_csv(file_path))
+        for file_path in glob.glob(os.path.join(data_dir, "*.xlsx")):
+            dfs.append(pd.read_excel(file_path))
+        for file_path in glob.glob(os.path.join(data_dir, "*.xls")):
+            dfs.append(pd.read_excel(file_path))
+
+    # 2. Load manually uploaded files
+    if uploaded_files:
+        for file in uploaded_files:
+            if file.name.endswith('.csv'):
+                dfs.append(pd.read_csv(file))
+            else:
+                dfs.append(pd.read_excel(file))
+                
+    if not dfs:
+        return pd.DataFrame()
+        
+    # Combine and deduplicate
+    combined_df = pd.concat(dfs, ignore_index=True)
+    
+    # Deduplicate exact rows to avoid double-counting trades overlapping across quarters/uploads
+    combined_df.drop_duplicates(inplace=True)
+    
+    return combined_df
 
 def classify_action(row):
     action = str(row["Action"]).upper()
@@ -304,16 +327,17 @@ def main():
     st.title("Portfolio Analysis (Correct Realized/Unrealized Profits)")
 
     uploaded_files = st.file_uploader(
-        "Upload one or more files (Excel/CSV) from Fidelity.",
+        "Upload one or more files (Excel/CSV) from Fidelity (Optional).",
         type=["xls", "xlsx", "csv"],
         accept_multiple_files=True
     )
 
-    if not uploaded_files:
-        st.info("Please upload your trade files.")
+    df = load_trade_data(uploaded_files)
+    
+    if df.empty:
+        st.info("Please upload your trade files, or ensure they are present in the 'data' folder.")
         return
 
-    df = read_uploaded_files(uploaded_files)
     df = preprocess_trades(df)
     symbols = get_symbol_list(df)
     symbol_name_map = get_symbol_name_map(df)
