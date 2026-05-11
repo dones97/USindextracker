@@ -159,6 +159,72 @@ def get_price_history(symbol, start, end):
     except Exception:
         return pd.Series()
 
+def get_risk_free_rate(start, end):
+    try:
+        irx = yf.download("^IRX", start=start, end=end, progress=False)
+        if irx.empty: return 0.04  # Fallback to 4%
+        if "Close" in irx.columns:
+            close_px = irx["Close"]
+        else:
+            return 0.04
+        if isinstance(close_px, pd.DataFrame):
+            close_px = close_px.iloc[:, 0]
+        # Yield is given as percentage (e.g., 4.5 for 4.5%), so divide by 100 for decimal
+        return float(close_px.mean()) / 100.0
+    except Exception:
+        return 0.04
+
+def simulate_spy_portfolio(trades, spy_prices):
+    if spy_prices.empty:
+        return pd.DataFrame(), np.nan
+    
+    spy_prices = spy_prices[~spy_prices.index.duplicated(keep='last')].sort_index()
+    all_days = pd.date_range(spy_prices.index.min(), spy_prices.index.max(), freq='D')
+    ff_spy = spy_prices.reindex(all_days).ffill()
+    
+    # Filter trades to only those that moved money in/out of stocks
+    valid_actions = trades[trades["ActionType"].isin(["BUY", "SELL", "REINVEST"])]
+    daily_flows = valid_actions.groupby("Run Date")["Amount ($)"].sum()
+    
+    spy_curve = []
+    spy_qty = 0.0
+    spy_invested = 0.0
+    spy_xirr_flows = []
+    
+    for date in all_days:
+        px = ff_spy.loc[date]
+        if pd.isna(px): continue
+            
+        if date in daily_flows.index:
+            flow = daily_flows.loc[date]
+            # flow is negative for money invested (BUY), positive for money returned (SELL)
+            shares = -flow / px
+            spy_qty += shares
+            spy_invested += -flow
+            spy_xirr_flows.append((date, flow))
+            
+        current_val = spy_qty * px
+        unrealized = current_val - spy_invested
+        
+        spy_curve.append({
+            "Date": date,
+            "CurrentValue": current_val,
+            "TotalProfit": unrealized,
+            "Unrealized": unrealized,
+            "Realized": 0.0
+        })
+        
+    if not spy_curve:
+        return pd.DataFrame(), np.nan
+        
+    spy_df = pd.DataFrame(spy_curve).set_index("Date")
+    last_val = spy_df["CurrentValue"].iloc[-1]
+    if last_val > 0:
+        spy_xirr_flows.append((spy_df.index[-1], last_val))
+    spy_xirr_val = xirr(spy_xirr_flows)
+    
+    return spy_df, spy_xirr_val
+
 def build_portfolio_profit_curve(trades, prices):
     # Check if prices is empty or has no valid dates
     if prices.empty or prices.index.isna().all():
@@ -445,9 +511,47 @@ def main():
     total_profit = current_portfolio_value - net_invested
     total_return_pct = (total_profit / net_invested) if net_invested != 0 else 0
 
-    st.write(f"**Portfolio XIRR:** {xirr_portfolio:.2%}")
-    st.write(f"**Total Return (%):** {total_return_pct:.2%}")
-    st.write(f"**Total Profit ($):** {total_profit:,.2f}")
+    # --- Calculate Risk-Free Rate and SPY Benchmark ---
+    rf_rate = get_risk_free_rate(t0, t1)
+    spy_prices = get_price_history("SPY", t0, t1)
+    
+    valid_trades_for_spy = df[df["Symbol"].isin(symbols)]
+    spy_curve, spy_xirr_val = simulate_spy_portfolio(valid_trades_for_spy, spy_prices)
+    
+    spy_profit = spy_curve["TotalProfit"].iloc[-1] if not spy_curve.empty else 0.0
+    
+    # Calculate Volatilities
+    portfolio_monthly = compute_monthly_returns(portfolio_curve)
+    port_vol = portfolio_monthly.std() * np.sqrt(12) / 100.0  # Annualized volatility as decimal
+    
+    if not spy_curve.empty:
+        spy_monthly = compute_monthly_returns(spy_curve)
+        spy_vol = spy_monthly.std() * np.sqrt(12) / 100.0
+    else:
+        spy_vol = np.nan
+        
+    # Calculate Sharpe Ratios
+    port_sharpe = (xirr_portfolio - rf_rate) / port_vol if port_vol > 0 else np.nan
+    spy_sharpe = (spy_xirr_val - rf_rate) / spy_vol if spy_vol > 0 else np.nan
+
+    # --- 1. Portfolio Level Metrics ---
+    st.header("1. Portfolio-level Metrics")
+    st.caption(f"Risk-Free Rate (T-Bill historical average used for Sharpe): {rf_rate:.2%}")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Your Portfolio")
+        st.write(f"**Total Profit ($):** {total_profit:,.2f}")
+        st.write(f"**Portfolio XIRR:** {xirr_portfolio:.2%}")
+        st.write(f"**Annualized Volatility:** {port_vol:.2%}")
+        st.write(f"**Sharpe Ratio:** {port_sharpe:.2f}")
+
+    with col2:
+        st.subheader("S&P 500 Benchmark (If fully invested)")
+        st.write(f"**Total Profit ($):** {spy_profit:,.2f}")
+        st.write(f"**S&P 500 XIRR:** {spy_xirr_val:.2%}")
+        st.write(f"**Annualized Volatility:** {spy_vol:.2%}")
+        st.write(f"**Sharpe Ratio:** {spy_sharpe:.2f}")
     
     st.info(f"debug: Net Invested: ${net_invested:,.2f}, Current Value: ${current_portfolio_value:,.2f}")
 
@@ -526,11 +630,12 @@ def main():
     table_df = pd.DataFrame(symbol_xirr, columns=["Symbol", "Fund Name", "XIRR"])
     st.dataframe(table_df[["Fund Name", "XIRR"]].style.format({"XIRR": "{:.2%}"}))
 
-    # --- 3. Portfolio Cumulative Profits ---
-    st.header("3. Portfolio Cumulative Profits")
+    st.header("3. Cumulative Profits Comparison")
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=portfolio_curve.index, y=portfolio_curve["TotalProfit"], mode='lines', name="Cumulative Profit"))
-    fig.update_layout(title="Cumulative Profits", yaxis_title="Profit ($)", xaxis_title="Date")
+    fig.add_trace(go.Scatter(x=portfolio_curve.index, y=portfolio_curve["TotalProfit"], mode='lines', name="Actual Portfolio"))
+    if not spy_curve.empty:
+        fig.add_trace(go.Scatter(x=spy_curve.index, y=spy_curve["TotalProfit"], mode='lines', name="S&P 500 (Hypothetical)"))
+    fig.update_layout(title="Cumulative Profits vs S&P 500", yaxis_title="Profit ($)", xaxis_title="Date", legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01))
     st.plotly_chart(fig, use_container_width=True)
 
     # --- 4. Annual Returns Bar Chart ---
