@@ -470,8 +470,7 @@ def main():
     for col in ['CurrentValue', 'CurrentQty']:
         portfolio_curve[col] = portfolio_curve[col].replace(0, np.nan).ffill().fillna(0.0)
 
-    # --- 1. Portfolio Level Metrics ---
-    st.header("1. Portfolio-level Metrics")
+    # End of Portfolio-level curve aggregation
     end_date = portfolio_curve.index[-1]
     current_portfolio_value = portfolio_curve['CurrentValue'].iloc[-1]
 
@@ -632,7 +631,7 @@ def main():
 
     st.header("3. Cumulative Profits Comparison")
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=portfolio_curve.index, y=portfolio_curve["TotalProfit"], mode='lines', name="Actual Portfolio"))
+    fig.add_trace(go.Scatter(x=portfolio_curve.index, y=portfolio_curve["TotalProfit"], mode='lines', name="Actual Portfolio", line=dict(color='red')))
     if not spy_curve.empty:
         fig.add_trace(go.Scatter(x=spy_curve.index, y=spy_curve["TotalProfit"], mode='lines', name="S&P 500 (Hypothetical)"))
     fig.update_layout(title="Cumulative Profits vs S&P 500", yaxis_title="Profit ($)", xaxis_title="Date", legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01))
