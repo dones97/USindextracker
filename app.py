@@ -92,6 +92,10 @@ def preprocess_trades(df):
         
     if "Amount ($)" in df.columns:
         df["Amount ($)"] = df["Amount ($)"].apply(parse_amount)
+    if "Quantity" in df.columns:
+        df["Quantity"] = df["Quantity"].apply(lambda x: parse_amount(x) if pd.notna(x) else 0.0)
+    if "Price ($)" in df.columns:
+        df["Price ($)"] = df["Price ($)"].apply(lambda x: parse_amount(x) if pd.notna(x) else 0.0)
     
     df["ActionType"] = df.apply(classify_action, axis=1)
     
@@ -280,8 +284,8 @@ def build_portfolio_profit_curve(trades, prices):
 def compute_monthly_returns(curve):
     value = curve["CurrentValue"] + curve["Realized"]
     value = value.ffill()
-    month_ends = value.resample("M").last()
-    month_starts = value.resample("M").first()
+    month_ends = value.resample("ME").last()
+    month_starts = value.resample("ME").first()
     returns = []
     months = month_ends.index
     for i in range(len(months)):
@@ -297,8 +301,8 @@ def compute_monthly_returns(curve):
 def compute_annual_returns(curve):
     value = curve["CurrentValue"] + curve["Realized"]
     value = value.ffill()
-    year_ends = value.resample("Y").last()
-    year_starts = value.resample("Y").first()
+    year_ends = value.resample("YE").last()
+    year_starts = value.resample("YE").first()
     years = year_ends.index
     returns = []
     for i in range(len(years)):
