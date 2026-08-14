@@ -174,6 +174,43 @@ def get_risk_free_rate(start, end):
     except Exception:
         return 0.04
 
+def get_split_adjustments(symbol):
+    """Retrieve stock split history for a symbol from yfinance.
+    
+    Returns a list of (date, ratio) tuples sorted by date.
+    For a 3-for-1 split, ratio = 3.0, meaning:
+      - Quantity should be multiplied by 3
+      - Price should be divided by 3
+    """
+    try:
+        ticker = yf.Ticker(symbol)
+        splits = ticker.splits
+        if splits.empty:
+            return []
+        result = []
+        for dt, ratio in splits.items():
+            # Normalize the date (remove timezone, normalize to midnight)
+            if hasattr(dt, 'tz') and dt.tz is not None:
+                dt = dt.tz_localize(None)
+            dt = pd.Timestamp(dt).normalize()
+            if ratio != 0 and ratio != 1.0:
+                result.append((dt, float(ratio)))
+        return sorted(result, key=lambda x: x[0])
+    except Exception:
+        return []
+
+def get_cumulative_split_factor(trade_date, split_history):
+    """Calculate the cumulative split factor for a trade made on trade_date.
+    
+    For splits that occurred AFTER the trade_date, multiply the factors together.
+    This tells us how many current shares one original share became.
+    """
+    factor = 1.0
+    for split_date, ratio in split_history:
+        if split_date > trade_date:
+            factor *= ratio
+    return factor
+
 def simulate_spy_portfolio(trades, spy_prices):
     if spy_prices.empty:
         return pd.DataFrame(), np.nan
@@ -225,7 +262,7 @@ def simulate_spy_portfolio(trades, spy_prices):
     
     return spy_df, spy_xirr_val
 
-def build_portfolio_profit_curve(trades, prices):
+def build_portfolio_profit_curve(trades, prices, split_history=None):
     # Check if prices is empty or has no valid dates
     if prices.empty or prices.index.isna().all():
         return pd.DataFrame(columns=['Unrealized', 'Realized', 'TotalProfit', 'CurrentValue', 'CurrentQty'])
@@ -239,6 +276,24 @@ def build_portfolio_profit_curve(trades, prices):
     all_days = pd.date_range(prices.index.min(), prices.index.max(), freq='D')
     ff_prices = prices.reindex(all_days).ffill()
     trades = trades.sort_values('Run Date')
+    
+    # Adjust trade quantities and prices for stock splits
+    # yfinance returns split-adjusted prices, so we need to adjust the trade data to match
+    if split_history:
+        trades = trades.copy()
+        adjusted_qtys = []
+        adjusted_prices = []
+        for _, row in trades.iterrows():
+            factor = get_cumulative_split_factor(row["Run Date"], split_history)
+            adjusted_qtys.append(row["Quantity"] * factor)
+            price_val = row["Price ($)"]
+            if pd.notna(price_val) and price_val != 0:
+                adjusted_prices.append(price_val / factor)
+            else:
+                adjusted_prices.append(price_val)
+        trades["Quantity"] = adjusted_qtys
+        trades["Price ($)"] = adjusted_prices
+    
     trades = trades.set_index('Run Date')
 
     lots = []
@@ -432,8 +487,9 @@ def main():
     t0 = df["Run Date"].min() - pd.Timedelta(days=5)
     t1 = datetime.today()
 
-    # Get price history for all symbols
+    # Get price history and split adjustments for all symbols
     all_prices = {}
+    all_splits = {}
     failed_symbols = []
     for symbol in symbols:
         prices = get_price_history(symbol, t0, t1)
@@ -441,6 +497,7 @@ def main():
             failed_symbols.append(symbol)
             st.warning(f"⚠️ Could not retrieve price data for symbol: {symbol}. This symbol will be skipped.")
         all_prices[symbol] = prices
+        all_splits[symbol] = get_split_adjustments(symbol)
 
     # Build and sum profit curves for all symbols
     profit_curves = {}
@@ -449,7 +506,8 @@ def main():
             continue  # Skip symbols with no price data
         trades = df[df["Symbol"] == symbol]
         prices = all_prices[symbol]
-        curve = build_portfolio_profit_curve(trades, prices)
+        split_history = all_splits.get(symbol, [])
+        curve = build_portfolio_profit_curve(trades, prices, split_history)
         if not curve.empty:
             profit_curves[symbol] = curve
 
@@ -537,10 +595,16 @@ def main():
     st.header("1. Portfolio-level Metrics")
     st.caption(f"Risk-Free Rate (T-Bill historical average used for Sharpe): {rf_rate:.2%}")
     
+    # Get realized and unrealized gains from the portfolio curve
+    portfolio_realized = portfolio_curve['Realized'].iloc[-1]
+    portfolio_unrealized = portfolio_curve['Unrealized'].iloc[-1]
+    
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Your Portfolio")
         st.write(f"**Total Profit ($):** {total_profit:,.2f}")
+        st.write(f"**Realized Gains/Losses ($):** {portfolio_realized:,.2f}")
+        st.write(f"**Unrealized Gains/Losses ($):** {portfolio_unrealized:,.2f}")
         st.write(f"**Portfolio XIRR:** {xirr_portfolio:.2%}")
         st.write(f"**Annualized Volatility:** {port_vol:.2%}")
         st.write(f"**Sharpe Ratio:** {port_sharpe:.2f}")
