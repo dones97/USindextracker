@@ -76,7 +76,7 @@ def classify_action(row):
 def preprocess_trades(df):
     df.columns = [col.strip() for col in df.columns]
     # Coerce errors to NaT to handle Fidelity's textual footer rows, then drop those rows
-    df["Run Date"] = pd.to_datetime(df["Run Date"], errors='coerce')
+    df["Run Date"] = pd.to_datetime(df["Run Date"], format='mixed', dayfirst=False, errors='coerce')
     df = df.dropna(subset=["Run Date"])
     df["Run Date"] = df["Run Date"].dt.normalize()
     
