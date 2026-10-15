@@ -49,6 +49,57 @@ def load_trade_data(uploaded_files, data_dir="data"):
     
     return combined_df
 
+def extract_daily_cash(uploaded_files=None, data_dir="data"):
+    files_data = []
+    if os.path.exists(data_dir):
+        for f in glob.glob(os.path.join(data_dir, "*.csv")):
+            try: files_data.append(pd.read_csv(f))
+            except Exception: pass
+        for f in glob.glob(os.path.join(data_dir, "*.xlsx")):
+            try: files_data.append(pd.read_excel(f))
+            except Exception: pass
+        for f in glob.glob(os.path.join(data_dir, "*.xls")):
+            try: files_data.append(pd.read_excel(f))
+            except Exception: pass
+    if uploaded_files:
+        for file in uploaded_files:
+            try:
+                if file.name.endswith('.csv'):
+                    files_data.append(pd.read_csv(file))
+                else:
+                    files_data.append(pd.read_excel(file))
+            except Exception: pass
+            
+    if not files_data:
+        return pd.Series(dtype=float)
+        
+    # Sort files by newest date first so latest records win if dates overlap
+    file_tuples = []
+    for f_df in files_data:
+        if 'Run Date' in f_df.columns:
+            dts = pd.to_datetime(f_df['Run Date'], format='mixed', errors='coerce').dropna()
+            max_dt = dts.max() if not dts.empty else pd.Timestamp.min
+            file_tuples.append((max_dt, f_df))
+    file_tuples.sort(key=lambda x: x[0], reverse=True)
+    
+    records = []
+    for _, f_df in file_tuples:
+        if 'Cash Balance ($)' not in f_df.columns or 'Run Date' not in f_df.columns:
+            continue
+        temp = f_df.copy()
+        temp['_Date'] = pd.to_datetime(temp['Run Date'], format='mixed', errors='coerce').dt.normalize()
+        temp = temp.dropna(subset=['_Date', 'Cash Balance ($)'])
+        for dt, group in temp.groupby('_Date', sort=False):
+            val = group['Cash Balance ($)'].iloc[0]
+            if pd.notna(val):
+                s = str(val).replace('$', '').replace(',', '').strip()
+                try: records.append({'Date': dt, 'Cash': float(s)})
+                except Exception: pass
+    if not records:
+        return pd.Series(dtype=float)
+    cash_df = pd.DataFrame(records).drop_duplicates(subset=['Date'], keep='first').set_index('Date').sort_index()
+    return cash_df['Cash']
+
 def classify_action(row):
     action = str(row["Action"]).upper()
     if "YOU BOUGHT" in action:
@@ -74,6 +125,7 @@ def classify_action(row):
     return "OTHER"
 
 def preprocess_trades(df):
+    df = df.copy()
     df.columns = [col.strip() for col in df.columns]
     # Coerce errors to NaT to handle Fidelity's textual footer rows, then drop those rows
     df["Run Date"] = pd.to_datetime(df["Run Date"], format='mixed', dayfirst=False, errors='coerce')
@@ -133,7 +185,7 @@ def get_price_history(symbol, start, end):
         return pd.Series(1.0, index=dates)
         
     try:
-        px = yf.download(symbol, start=start, end=end, progress=False)
+        px = yf.download(symbol, start=start, end=end, progress=False, auto_adjust=False)
         if px.empty: 
             return pd.Series()
         
@@ -161,7 +213,7 @@ def get_price_history(symbol, start, end):
 
 def get_risk_free_rate(start, end):
     try:
-        irx = yf.download("^IRX", start=start, end=end, progress=False)
+        irx = yf.download("^IRX", start=start, end=end, progress=False, auto_adjust=False)
         if irx.empty: return 0.04  # Fallback to 4%
         if "Close" in irx.columns:
             close_px = irx["Close"]
@@ -528,9 +580,28 @@ def main():
     for col in ['CurrentValue', 'CurrentQty']:
         portfolio_curve[col] = portfolio_curve[col].replace(0, np.nan).ffill().fillna(0.0)
 
+    # Extract daily cash balance and incorporate into portfolio curve
+    cash_series = extract_daily_cash(uploaded_files).reindex(portfolio_curve.index).ffill().fillna(0.0)
+    
+    # Track SPAXX/Cash dividends (income earned on cash)
+    cash_divs = df[df["Symbol"].isin(["SPAXX", "CASH", "FDRXX"]) & (df["ActionType"] == "DIVIDEND")]
+    if not cash_divs.empty:
+        daily_cash_div = cash_divs.groupby("Run Date")["Amount ($)"].sum()
+        cum_cash_div = daily_cash_div.reindex(portfolio_curve.index).fillna(0.0).cumsum()
+    else:
+        cum_cash_div = pd.Series(0.0, index=portfolio_curve.index)
+
+    portfolio_curve["HoldingsValue"] = portfolio_curve["CurrentValue"]
+    portfolio_curve["Cash"] = cash_series
+    portfolio_curve["CurrentValue"] += cash_series
+    portfolio_curve["Realized"] += cum_cash_div
+    portfolio_curve["TotalProfit"] = portfolio_curve["Realized"] + portfolio_curve["Unrealized"]
+
     # End of Portfolio-level curve aggregation
     end_date = portfolio_curve.index[-1]
     current_portfolio_value = portfolio_curve['CurrentValue'].iloc[-1]
+    current_holdings_value = portfolio_curve['HoldingsValue'].iloc[-1]
+    current_cash_value = portfolio_curve['Cash'].iloc[-1]
 
     # Calculate Net Invested and Portfolio XIRR using External Flows (Deposits/Withdrawals)
     # Filter for external flows
@@ -616,7 +687,7 @@ def main():
         st.write(f"**Annualized Volatility:** {spy_vol:.2%}")
         st.write(f"**Sharpe Ratio:** {spy_sharpe:.2f}")
     
-    st.info(f"debug: Net Invested: ${net_invested:,.2f}, Current Value: ${current_portfolio_value:,.2f}")
+    st.info(f"Net Invested: ${net_invested:,.2f} | Current Value: ${current_portfolio_value:,.2f} (Holdings: ${current_holdings_value:,.2f}, Cash / SPAXX: ${current_cash_value:,.2f})")
 
     # --- 2. Symbol-level comparison & XIRR table ---
     st.header("2. Fund Movements (XIRR Table)")
