@@ -18,88 +18,6 @@ def xirr(cashflows):
     except Exception:
         return np.nan
 
-def load_trade_data(uploaded_files, data_dir="data"):
-    dfs = []
-    
-    # 1. Load files from the local data directory
-    if os.path.exists(data_dir):
-        for file_path in glob.glob(os.path.join(data_dir, "*.csv")):
-            dfs.append(pd.read_csv(file_path))
-        for file_path in glob.glob(os.path.join(data_dir, "*.xlsx")):
-            dfs.append(pd.read_excel(file_path))
-        for file_path in glob.glob(os.path.join(data_dir, "*.xls")):
-            dfs.append(pd.read_excel(file_path))
-
-    # 2. Load manually uploaded files
-    if uploaded_files:
-        for file in uploaded_files:
-            if file.name.endswith('.csv'):
-                dfs.append(pd.read_csv(file))
-            else:
-                dfs.append(pd.read_excel(file))
-                
-    if not dfs:
-        return pd.DataFrame()
-        
-    # Combine and deduplicate
-    combined_df = pd.concat(dfs, ignore_index=True)
-    
-    # Deduplicate exact rows to avoid double-counting trades overlapping across quarters/uploads
-    combined_df.drop_duplicates(inplace=True)
-    
-    return combined_df
-
-def extract_daily_cash(uploaded_files=None, data_dir="data"):
-    files_data = []
-    if os.path.exists(data_dir):
-        for f in glob.glob(os.path.join(data_dir, "*.csv")):
-            try: files_data.append(pd.read_csv(f))
-            except Exception: pass
-        for f in glob.glob(os.path.join(data_dir, "*.xlsx")):
-            try: files_data.append(pd.read_excel(f))
-            except Exception: pass
-        for f in glob.glob(os.path.join(data_dir, "*.xls")):
-            try: files_data.append(pd.read_excel(f))
-            except Exception: pass
-    if uploaded_files:
-        for file in uploaded_files:
-            try:
-                if file.name.endswith('.csv'):
-                    files_data.append(pd.read_csv(file))
-                else:
-                    files_data.append(pd.read_excel(file))
-            except Exception: pass
-            
-    if not files_data:
-        return pd.Series(dtype=float)
-        
-    # Sort files by newest date first so latest records win if dates overlap
-    file_tuples = []
-    for f_df in files_data:
-        if 'Run Date' in f_df.columns:
-            dts = pd.to_datetime(f_df['Run Date'], format='mixed', errors='coerce').dropna()
-            max_dt = dts.max() if not dts.empty else pd.Timestamp.min
-            file_tuples.append((max_dt, f_df))
-    file_tuples.sort(key=lambda x: x[0], reverse=True)
-    
-    records = []
-    for _, f_df in file_tuples:
-        if 'Cash Balance ($)' not in f_df.columns or 'Run Date' not in f_df.columns:
-            continue
-        temp = f_df.copy()
-        temp['_Date'] = pd.to_datetime(temp['Run Date'], format='mixed', errors='coerce').dt.normalize()
-        temp = temp.dropna(subset=['_Date', 'Cash Balance ($)'])
-        for dt, group in temp.groupby('_Date', sort=False):
-            val = group['Cash Balance ($)'].iloc[0]
-            if pd.notna(val):
-                s = str(val).replace('$', '').replace(',', '').strip()
-                try: records.append({'Date': dt, 'Cash': float(s)})
-                except Exception: pass
-    if not records:
-        return pd.Series(dtype=float)
-    cash_df = pd.DataFrame(records).drop_duplicates(subset=['Date'], keep='first').set_index('Date').sort_index()
-    return cash_df['Cash']
-
 def classify_action(row):
     action = str(row["Action"]).upper()
     if "YOU BOUGHT" in action:
@@ -134,13 +52,19 @@ def preprocess_trades(df):
     
     # helper for amount parsing
     def parse_amount(x):
+        if pd.isna(x):
+            return 0.0
         if isinstance(x, (int, float)):
             return float(x)
         s = str(x).replace('$', '').replace(',', '').strip()
         if '(' in s and ')' in s:
             s = '-' + s.replace('(', '').replace(')', '')
-        # Handle cases where - is at end? Or other formats?
-        return float(s)
+        if not s:
+            return 0.0
+        try:
+            return float(s)
+        except Exception:
+            return 0.0
         
     if "Amount ($)" in df.columns:
         df["Amount ($)"] = df["Amount ($)"].apply(parse_amount)
@@ -156,6 +80,186 @@ def preprocess_trades(df):
     df = df[df["ActionType"].isin(relevant_types)]
     
     return df
+
+def load_trade_data(uploaded_files=None, data_dir="data", return_info=False):
+    raw_dfs = []
+    repo_file_names = []
+    uploaded_file_names = []
+    
+    # 1. Load files from repository directory
+    if data_dir and os.path.exists(data_dir):
+        exts = ["*.csv", "*.xlsx", "*.xls"]
+        file_paths = []
+        for ext in exts:
+            file_paths.extend(glob.glob(os.path.join(data_dir, ext)))
+        file_paths = sorted(file_paths)
+        
+        for fp in file_paths:
+            try:
+                base_name = os.path.basename(fp)
+                if fp.endswith(".csv"):
+                    df = pd.read_csv(fp)
+                else:
+                    df = pd.read_excel(fp)
+                raw_dfs.append((base_name, "repository", df))
+                repo_file_names.append(base_name)
+            except Exception:
+                pass
+
+    # 2. Load manually uploaded files
+    if uploaded_files:
+        for f in uploaded_files:
+            try:
+                fname = getattr(f, "name", "uploaded_file")
+                if hasattr(f, "seek"):
+                    f.seek(0)
+                if fname.endswith(".csv"):
+                    df = pd.read_csv(f)
+                else:
+                    df = pd.read_excel(f)
+                if hasattr(f, "seek"):
+                    f.seek(0)
+                raw_dfs.append((fname, "upload", df))
+                uploaded_file_names.append(fname)
+            except Exception:
+                pass
+
+    if not raw_dfs:
+        empty_info = {
+            "total_raw_rows": 0,
+            "final_rows": 0,
+            "num_duplicates": 0,
+            "repo_files_count": 0,
+            "uploaded_files_count": 0,
+            "repo_files": [],
+            "uploaded_files": []
+        }
+        return (pd.DataFrame(), empty_info) if return_info else pd.DataFrame()
+
+    # Preprocess each file individually to produce normalized fields
+    processed_dfs = []
+    for fname, source_type, raw_df in raw_dfs:
+        try:
+            pdf = preprocess_trades(raw_df)
+            if pdf.empty:
+                continue
+            pdf["_source_file"] = fname
+            pdf["_source_type"] = source_type
+            
+            # Construct normalized trade signature components
+            amt_s = pdf["Amount ($)"].replace(-0.0, 0.0).round(2).astype(str)
+            qty_s = pdf["Quantity"].replace(-0.0, 0.0).round(6).astype(str)
+            price_s = pdf["Price ($)"].replace(-0.0, 0.0).round(4).astype(str)
+            sym_s = pdf["Symbol"].fillna("__CASH__").astype(str).str.strip().str.upper()
+            action_s = pdf["ActionType"].astype(str).str.strip().str.upper()
+            date_s = pdf["Run Date"].dt.strftime("%Y-%m-%d")
+            
+            # Signature key representing the exact financial transaction
+            pdf["_sig_key"] = date_s + "|" + action_s + "|" + sym_s + "|" + amt_s + "|" + qty_s + "|" + price_s
+            # Intra-file occurrence index preserves multiple legitimate identical trades placed in a single statement
+            pdf["_occ"] = pdf.groupby("_sig_key").cumcount()
+            pdf["_dedup_id"] = pdf["_sig_key"] + "|" + pdf["_occ"].astype(str)
+            
+            processed_dfs.append(pdf)
+        except Exception:
+            pass
+
+    if not processed_dfs:
+        empty_info = {
+            "total_raw_rows": 0,
+            "final_rows": 0,
+            "num_duplicates": 0,
+            "repo_files_count": len(repo_file_names),
+            "uploaded_files_count": len(uploaded_file_names),
+            "repo_files": repo_file_names,
+            "uploaded_files": uploaded_file_names
+        }
+        return (pd.DataFrame(), empty_info) if return_info else pd.DataFrame()
+
+    combined_df = pd.concat(processed_dfs, ignore_index=True)
+    total_raw_rows = len(combined_df)
+
+    # Identify duplicate rows across files
+    is_duplicate = combined_df.duplicated(subset=["_dedup_id"], keep="first")
+    num_duplicates = int(is_duplicate.sum())
+    
+    # Keep only the unique set of entries
+    clean_df = combined_df[~is_duplicate].copy()
+    
+    # Sort chronologically by Run Date
+    clean_df.sort_values(by="Run Date", inplace=True)
+    clean_df.reset_index(drop=True, inplace=True)
+
+    info = {
+        "total_raw_rows": total_raw_rows,
+        "final_rows": len(clean_df),
+        "num_duplicates": num_duplicates,
+        "repo_files_count": len(repo_file_names),
+        "uploaded_files_count": len(uploaded_file_names),
+        "repo_files": repo_file_names,
+        "uploaded_files": uploaded_file_names,
+    }
+
+    # Clean up internal helper columns
+    clean_df.drop(columns=["_sig_key", "_occ", "_dedup_id", "_source_file", "_source_type"], inplace=True, errors="ignore")
+
+    return (clean_df, info) if return_info else clean_df
+
+def extract_daily_cash(uploaded_files=None, data_dir="data"):
+    files_data = []
+    if os.path.exists(data_dir):
+        for f in glob.glob(os.path.join(data_dir, "*.csv")):
+            try: files_data.append(pd.read_csv(f))
+            except Exception: pass
+        for f in glob.glob(os.path.join(data_dir, "*.xlsx")):
+            try: files_data.append(pd.read_excel(f))
+            except Exception: pass
+        for f in glob.glob(os.path.join(data_dir, "*.xls")):
+            try: files_data.append(pd.read_excel(f))
+            except Exception: pass
+    if uploaded_files:
+        for file in uploaded_files:
+            try:
+                if hasattr(file, 'seek'):
+                    file.seek(0)
+                fname = getattr(file, 'name', 'file.csv')
+                if fname.endswith('.csv'):
+                    files_data.append(pd.read_csv(file))
+                else:
+                    files_data.append(pd.read_excel(file))
+                if hasattr(file, 'seek'):
+                    file.seek(0)
+            except Exception: pass
+            
+    if not files_data:
+        return pd.Series(dtype=float)
+        
+    # Sort files by newest date first so latest records win if dates overlap
+    file_tuples = []
+    for f_df in files_data:
+        if 'Run Date' in f_df.columns:
+            dts = pd.to_datetime(f_df['Run Date'], format='mixed', errors='coerce').dropna()
+            max_dt = dts.max() if not dts.empty else pd.Timestamp.min
+            file_tuples.append((max_dt, f_df))
+    file_tuples.sort(key=lambda x: x[0], reverse=True)
+    
+    records = []
+    for _, f_df in file_tuples:
+        if 'Cash Balance ($)' not in f_df.columns or 'Run Date' not in f_df.columns:
+            continue
+        temp = f_df.copy()
+        temp['_Date'] = pd.to_datetime(temp['Run Date'], format='mixed', errors='coerce').dt.normalize()
+        temp = temp.dropna(subset=['_Date', 'Cash Balance ($)'])
+        for dt, group in temp.groupby('_Date', sort=False):
+            val = group['Cash Balance ($)'].iloc[0]
+            if pd.notna(val):
+                s = str(val).replace('$', '').replace(',', '').strip()
+                try: records.append({'Date': dt, 'Cash': float(s)})
+                except Exception: pass
+    if not records:
+        return pd.Series(dtype=float)
+    cash_df = pd.DataFrame(records).drop_duplicates(subset=['Date'], keep='first').set_index('Date').sort_index()
+    return cash_df['Cash']
 
 def get_symbol_list(df):
     syms = df["Symbol"].dropna().unique()
@@ -527,11 +631,23 @@ def main():
         accept_multiple_files=True
     )
 
-    df = load_trade_data(uploaded_files)
+    df, load_info = load_trade_data(uploaded_files, return_info=True)
     
     if df.empty:
         st.info("Please upload your trade files, or ensure they are present in the 'data' folder.")
         return
+
+    # Inform the user when duplicate entries across overlapping reports were identified and removed
+    if load_info.get("num_duplicates", 0) > 0:
+        st.info(
+            f"ℹ️ **Overlapping Trade Reports Merged:** Detected and resolved **{load_info['num_duplicates']} duplicate trade entries** "
+            f"across reports ({load_info['repo_files_count']} repository file(s) and {load_info['uploaded_files_count']} uploaded file(s)). "
+            f"A single unified set of transactions is used."
+        )
+    elif load_info.get("uploaded_files_count", 0) > 0:
+        st.success(
+            f"✅ Successfully loaded {load_info['uploaded_files_count']} uploaded report(s) alongside {load_info['repo_files_count']} repository file(s) with no duplicates."
+        )
 
     df = preprocess_trades(df)
     symbols = get_symbol_list(df)
