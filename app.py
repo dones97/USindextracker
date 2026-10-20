@@ -5,6 +5,8 @@ import yfinance as yf
 from datetime import datetime, timedelta
 from scipy.optimize import newton
 import plotly.graph_objs as go
+import plotly.colors as pcolors
+from plotly.subplots import make_subplots
 import os
 import glob
 
@@ -289,21 +291,23 @@ def get_symbol_name_map(df):
         name_map = {s: s for s in df["Symbol"].unique()}
     return name_map
 
-def get_price_history(symbol, start, end):
+def get_price_history(symbol, start, end, adjusted=False):
     # Special handling for Cash/Money Market
     if symbol == "SPAXX" or symbol == "Cash":
         # Create a dummy series of 1.0
         dates = pd.date_range(start, end, freq='D')
         return pd.Series(1.0, index=dates)
-        
+
     try:
         px = yf.download(symbol, start=start, end=end, progress=False, auto_adjust=False)
-        if px.empty: 
+        if px.empty:
             return pd.Series()
-        
+
+        # Adjusted close includes reinvested dividends (total return)
+        price_col = "Adj Close" if adjusted else "Close"
         # yfinance might return multi-index columns if only 1 ticker but formatted that way
-        if "Close" in px.columns:
-            close_px = px["Close"]
+        if price_col in px.columns:
+            close_px = px[price_col]
         else:
             return pd.Series()
             
@@ -637,20 +641,106 @@ def compute_annual_returns(curve):
             returns.append((profit_change / denom) * 100)
     return pd.Series(returns, index=years)
 
-def wrap_labels(labels, width=15):
-    wrapped = []
-    for label in labels:
-        # Try to break at spaces, otherwise just insert <br> every width chars
-        parts = []
-        while len(label) > width:
-            idx = label[:width].rfind(' ')
-            if idx == -1:
-                idx = width
-            parts.append(label[:idx])
-            label = label[idx:].lstrip()
-        parts.append(label)
-        wrapped.append('<br>'.join(parts))
-    return wrapped
+def benchmark_return_for_trades(trades, spy_adj, invested, end_date):
+    """S&P 500 total return (%) had the fund's own buys/sells gone into SPY instead.
+
+    Uses the same dollar flows on the same dates, valued at end_date (today for a
+    held fund, the last trade date for a closed one) and divided by the same
+    invested amount as the fund's total return, so the two are directly comparable.
+    """
+    if spy_adj.empty or invested == 0:
+        return np.nan
+    flows = trades[trades["ActionType"].isin(["BUY", "SELL"])]
+    spy_qty = 0.0
+    net_cash = 0.0
+    for _, row in flows.iterrows():
+        px = spy_adj.asof(row["Run Date"])
+        if pd.isna(px):
+            px = spy_adj.iloc[0]
+        amt = float(row["Amount ($)"])
+        spy_qty += -amt / px
+        net_cash += amt
+    end_px = spy_adj.asof(end_date)
+    if pd.isna(end_px):
+        return np.nan
+    return (spy_qty * end_px + net_cash) / invested * 100
+
+def benchmark_period_returns(spy_adj, period_ends, freq, port_start, port_end):
+    """S&P 500 total return (%) for each period, clipped to the portfolio's lifetime.
+
+    A period that began before the portfolio existed (or is still in progress)
+    only counts the days the portfolio was actually invested.
+    """
+    results = []
+    for p_end in period_ends:
+        p_start = p_end.replace(day=1) if freq == "M" else p_end.replace(month=1, day=1)
+        start_ref = max(p_start - pd.Timedelta(days=1), port_start)
+        end_ref = min(p_end, port_end)
+        if spy_adj.empty or start_ref >= end_ref:
+            results.append(np.nan)
+            continue
+        px0, px1 = spy_adj.asof(start_ref), spy_adj.asof(end_ref)
+        results.append((px1 / px0 - 1) * 100 if pd.notna(px0) and pd.notna(px1) and px0 else np.nan)
+    return pd.Series(results, index=period_ends)
+
+def databar_chart(labels, values, benchmarks, title, benchmark_name="S&P 500"):
+    """Horizontal data-bar chart: label | value % | bar, with a dashed benchmark line per row.
+
+    All rows share one x scale, and bars are shaded red (negative) to green (positive)
+    on a symmetric scale so equal magnitudes get equal intensity.
+    """
+    values = list(values)
+    benchmarks = list(benchmarks)
+    n = len(values)
+    vals_arr = np.array(values, dtype=float)
+    bench_arr = np.array(benchmarks, dtype=float)
+
+    max_abs = np.nanmax(np.abs(vals_arr)) if n else 1.0
+    max_abs = max_abs if max_abs > 0 else 1.0
+    colors = pcolors.sample_colorscale("RdYlGn", [(v / max_abs + 1) / 2 for v in np.nan_to_num(vals_arr)])
+
+    all_x = np.concatenate([vals_arr, bench_arr, [0.0]])
+    x_min, x_max = np.nanmin(all_x), np.nanmax(all_x)
+    pad = (x_max - x_min) * 0.05 or 1.0
+    x_range = [x_min - pad if x_min < 0 else 0, x_max + pad if x_max > 0 else 0]
+
+    fig = make_subplots(rows=1, cols=2, shared_yaxes=True, column_widths=[0.1, 0.9], horizontal_spacing=0.01)
+    fig.add_trace(go.Scatter(
+        x=[0] * n, y=labels, mode="text",
+        text=[f"<b>{v:+.1f}%</b>" for v in values],
+        textposition="middle center", hoverinfo="skip", showlegend=False,
+    ), row=1, col=1)
+    fig.add_trace(go.Bar(
+        x=values, y=labels, orientation="h",
+        marker=dict(color=colors, line=dict(width=0)),
+        customdata=bench_arr.tolist(),
+        hovertemplate="%{y}<br>Return: %{x:.1f}%<br>" + benchmark_name + ": %{customdata:.1f}%<extra></extra>",
+        showlegend=False,
+    ), row=1, col=2)
+
+    for i, b in enumerate(benchmarks):
+        if pd.isna(b):
+            continue
+        fig.add_shape(type="line", x0=b, x1=b, y0=i - 0.45, y1=i + 0.45,
+                      line=dict(color="#2c7fb8", width=2, dash="dash"), row=1, col=2)
+    # Legend entry for the dashed benchmark lines (shapes don't appear in legends)
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode="lines", name=benchmark_name,
+        line=dict(color="#2c7fb8", width=2, dash="dash"),
+    ), row=1, col=2)
+
+    fig.update_yaxes(autorange="reversed", type="category", automargin=True, row=1, col=1)
+    fig.update_xaxes(visible=False, range=[-1, 1], fixedrange=True, row=1, col=1)
+    fig.update_xaxes(range=x_range, ticksuffix="%", zeroline=True, zerolinewidth=1,
+                     showgrid=True, row=1, col=2)
+    fig.update_layout(
+        title=title,
+        height=max(250, 32 * n + 130),
+        bargap=0.25,
+        margin=dict(l=10, r=10, t=70, b=30),
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1.0),
+    )
+    return fig
 
 def main():
     st.title("Portfolio Analysis (Correct Realized/Unrealized Profits)")
@@ -788,7 +878,10 @@ def main():
     # --- Calculate Risk-Free Rate and SPY Benchmark ---
     rf_rate = get_risk_free_rate(t0, t1)
     spy_prices = get_price_history("SPY", t0, t1)
-    
+    # Total-return SPY series (dividends reinvested) for the per-row benchmark lines
+    spy_adj = get_price_history("SPY", t0, t1, adjusted=True)
+    port_start = df["Run Date"].min()
+
     valid_trades_for_spy = df[df["Symbol"].isin(symbols)]
     spy_curve, spy_xirr_val = simulate_spy_portfolio(valid_trades_for_spy, spy_prices)
     
@@ -886,30 +979,35 @@ def main():
         
         total_ret = (sym_profit / invested) if invested != 0 else 0
         fund_name = symbol_name_map.get(symbol, symbol)
-        symbol_xirr.append((symbol, fund_name, sym_xirr))
-        symbol_total_return.append((fund_name, total_ret * 100))
+        is_held = curve['CurrentQty'].iloc[-1] > 1e-4
+        # Benchmark over the holding period: to today if still held, else to the last trade
+        hold_end = curve.index[-1] if is_held else trades["Run Date"].max()
+        spy_ret = benchmark_return_for_trades(trades, spy_adj, invested, hold_end)
+        symbol_xirr.append((symbol, fund_name, sym_xirr, is_held))
+        symbol_total_return.append((fund_name, total_ret * 100, spy_ret, is_held))
 
-    # Bar chart: total return % per fund
-    sym_df = pd.DataFrame(symbol_total_return, columns=["Fund Name", "TotalReturn"])
+    show_past = st.checkbox("Show past investments (fully sold funds/ETFs)", value=False)
+
+    # Data-bar chart: total return % per fund vs S&P 500 over the same holding period
+    sym_df = pd.DataFrame(symbol_total_return, columns=["Fund Name", "TotalReturn", "SPYReturn", "Held"])
+    if not show_past:
+        sym_df = sym_df[sym_df["Held"]]
     sym_df = sym_df.sort_values(by="TotalReturn", ascending=False)
-    wrapped_fund_names = wrap_labels(sym_df["Fund Name"].tolist(), width=15)
-    
-    fund_labels = [f"{val:.1f}%" for val in sym_df["TotalReturn"]]
-    fig = go.Figure(data=[
-        go.Bar(x=wrapped_fund_names, y=sym_df["TotalReturn"], text=fund_labels, textposition='auto')
-    ])
-    fig.update_layout(
-        barmode='group',
-        title="Fund Total Return (%)",
-        yaxis_title="Return (%)",
-        xaxis_title="Fund",
-        xaxis_tickangle=-90,
-        margin=dict(b=150),
-    )
-    st.plotly_chart(fig, use_container_width=True)
+
+    if sym_df.empty:
+        st.info("No funds/ETFs to show. Tick the box above to include past investments.")
+    else:
+        fig = databar_chart(
+            sym_df["Fund Name"].tolist(), sym_df["TotalReturn"], sym_df["SPYReturn"],
+            title="Fund Total Return (%)",
+            benchmark_name="S&P 500 (same cash flows, same holding period)",
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
     # Data Table: XIRR per fund
-    table_df = pd.DataFrame(symbol_xirr, columns=["Symbol", "Fund Name", "XIRR"])
+    table_df = pd.DataFrame(symbol_xirr, columns=["Symbol", "Fund Name", "XIRR", "Held"])
+    if not show_past:
+        table_df = table_df[table_df["Held"]]
     st.dataframe(table_df[["Fund Name", "XIRR"]].style.format({"XIRR": "{:.2%}"}))
 
     st.header("3. Cumulative Profits Comparison")
@@ -922,35 +1020,29 @@ def main():
 
     # --- 4. Annual Returns Bar Chart ---
     st.header("4. Annual Returns (%)")
+    port_end = portfolio_curve.index[-1]
     annual_returns = compute_annual_returns(portfolio_curve)
+    # Drop periods that ended before the first trade (curve starts a few days early)
+    annual_returns = annual_returns[annual_returns.index >= port_start]
+    annual_spy = benchmark_period_returns(spy_adj, annual_returns.index, "Y", port_start, port_end)
     years = [d.strftime("%Y") for d in annual_returns.index]
-    ann_labels = [f"{val:.1f}%" if pd.notna(val) else "" for val in annual_returns.values]
-    fig = go.Figure(data=[
-        go.Bar(name='Portfolio', x=years, y=annual_returns.values, text=ann_labels, textposition='auto')
-    ])
-    fig.update_layout(
-        barmode='group', 
-        title="Annual Returns (%)", 
-        yaxis_title="Return (%)", 
-        xaxis_title="Year",
-        xaxis=dict(type='category')
+    fig = databar_chart(
+        years, annual_returns.values, annual_spy.values,
+        title="Annual Returns (%)",
+        benchmark_name="S&P 500 (portfolio's active dates only)",
     )
     st.plotly_chart(fig, use_container_width=True)
 
     # --- 5. Monthly Returns Bar Chart ---
     st.header("5. Monthly Returns (%)")
     monthly_returns = compute_monthly_returns(portfolio_curve)
+    monthly_returns = monthly_returns[monthly_returns.index >= port_start]
+    monthly_spy = benchmark_period_returns(spy_adj, monthly_returns.index, "M", port_start, port_end)
     months = [d.strftime("%Y-%m") for d in monthly_returns.index]
-    mon_labels = [f"{val:.1f}%" if pd.notna(val) else "" for val in monthly_returns.values]
-    fig = go.Figure(data=[
-        go.Bar(name='Portfolio', x=months, y=monthly_returns.values, text=mon_labels, textposition='auto')
-    ])
-    fig.update_layout(
-        barmode='group', 
-        title="Monthly Returns (%)", 
-        yaxis_title="Return (%)", 
-        xaxis_title="Month",
-        xaxis=dict(type='category')
+    fig = databar_chart(
+        months, monthly_returns.values, monthly_spy.values,
+        title="Monthly Returns (%)",
+        benchmark_name="S&P 500 (portfolio's active dates only)",
     )
     st.plotly_chart(fig, use_container_width=True)
 
