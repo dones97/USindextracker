@@ -736,7 +736,7 @@ def databar_chart(labels, values, benchmarks, title, benchmark_name="S&P 500"):
     ))
 
     # Return % column sits in the gap between the row labels and the bars
-    pct_col_px = 75
+    pct_col_px = 90
     for i, v in enumerate(values):
         fig.add_annotation(
             x=0, xref="paper", xanchor="right", xshift=-10, y=i, yref="y",
