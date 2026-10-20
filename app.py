@@ -6,9 +6,11 @@ from datetime import datetime, timedelta
 from scipy.optimize import newton
 import plotly.graph_objs as go
 import plotly.colors as pcolors
-from plotly.subplots import make_subplots
 import os
 import glob
+
+# S&P 500 benchmark styling, shared by every chart
+BENCHMARK_COLOR = "#2c7fb8"
 
 def xnpv(rate, cashflows):
     t0 = cashflows[0][0]
@@ -704,41 +706,58 @@ def databar_chart(labels, values, benchmarks, title, benchmark_name="S&P 500"):
     pad = (x_max - x_min) * 0.05 or 1.0
     x_range = [x_min - pad if x_min < 0 else 0, x_max + pad if x_max > 0 else 0]
 
-    fig = make_subplots(rows=1, cols=2, shared_yaxes=True, column_widths=[0.1, 0.9], horizontal_spacing=0.01)
-    fig.add_trace(go.Scatter(
-        x=[0] * n, y=labels, mode="text",
-        text=[f"<b>{v:+.1f}%</b>" for v in values],
-        textposition="middle center", hoverinfo="skip", showlegend=False,
-    ), row=1, col=1)
+    # Row positions 0..n-1 on a category axis keep bars, labels and benchmark lines aligned
+    # (labels like "2025" or "2025-07" would otherwise be auto-typed as numbers/dates).
+    positions = list(range(n))
+    fig = go.Figure()
     fig.add_trace(go.Bar(
-        x=values, y=labels, orientation="h",
+        x=values, y=positions, orientation="h",
         marker=dict(color=colors, line=dict(width=0)),
-        customdata=bench_arr.tolist(),
-        hovertemplate="%{y}<br>Return: %{x:.1f}%<br>" + benchmark_name + ": %{customdata:.1f}%<extra></extra>",
+        customdata=np.column_stack([labels, bench_arr]).tolist() if n else [],
+        hovertemplate="%{customdata[0]}<br>Return: %{x:.1f}%<br>" + benchmark_name
+                      + ": %{customdata[1]:.1f}%<extra></extra>",
         showlegend=False,
-    ), row=1, col=2)
+    ))
+    # Invisible trace on the top axis so its tick labels are drawn
+    fig.add_trace(go.Scatter(
+        x=x_range, y=[0, 0], xaxis="x2", mode="markers", marker=dict(opacity=0),
+        hoverinfo="skip", showlegend=False,
+    ))
 
     for i, b in enumerate(benchmarks):
         if pd.isna(b):
             continue
-        fig.add_shape(type="line", x0=b, x1=b, y0=i - 0.45, y1=i + 0.45,
-                      line=dict(color="#2c7fb8", width=2, dash="dash"), row=1, col=2)
+        fig.add_shape(type="line", x0=b, x1=b, y0=i - 0.45, y1=i + 0.45, xref="x", yref="y",
+                      line=dict(color=BENCHMARK_COLOR, width=2, dash="dash"))
     # Legend entry for the dashed benchmark lines (shapes don't appear in legends)
     fig.add_trace(go.Scatter(
         x=[None], y=[None], mode="lines", name=benchmark_name,
-        line=dict(color="#2c7fb8", width=2, dash="dash"),
-    ), row=1, col=2)
+        line=dict(color=BENCHMARK_COLOR, width=2, dash="dash"),
+    ))
 
-    fig.update_yaxes(autorange="reversed", type="category", automargin=True, row=1, col=1)
-    fig.update_xaxes(visible=False, range=[-1, 1], fixedrange=True, row=1, col=1)
-    fig.update_xaxes(range=x_range, ticksuffix="%", zeroline=True, zerolinewidth=1,
-                     showgrid=True, row=1, col=2)
+    # Return % column sits in the gap between the row labels and the bars
+    pct_col_px = 75
+    for i, v in enumerate(values):
+        fig.add_annotation(
+            x=0, xref="paper", xanchor="right", xshift=-10, y=i, yref="y",
+            text=f"<b>{v:.1f}%</b>", showarrow=False, font=dict(size=13),
+        )
+
+    height = max(260, 30 * n + 160)
+    margin = dict(l=10, r=20, t=110, b=50)
+    plot_h = height - margin["t"] - margin["b"]
+    fig.update_yaxes(
+        type="category", tickvals=positions, ticktext=labels, autorange="reversed",
+        ticklabelstandoff=pct_col_px, automargin=True, showgrid=False,
+    )
     fig.update_layout(
         title=title,
-        height=max(250, 32 * n + 130),
-        bargap=0.25,
-        margin=dict(l=10, r=10, t=70, b=30),
-        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1.0),
+        height=height,
+        bargap=0.3,
+        margin=margin,
+        xaxis=dict(range=x_range, ticksuffix="%", zeroline=True, zerolinewidth=1, showgrid=True),
+        xaxis2=dict(overlaying="x", side="top", matches="x", ticksuffix="%", showgrid=False),
+        legend=dict(orientation="h", yanchor="bottom", y=1 + 30 / plot_h, xanchor="right", x=1.0),
     )
     return fig
 
@@ -1008,13 +1027,14 @@ def main():
     table_df = pd.DataFrame(symbol_xirr, columns=["Symbol", "Fund Name", "XIRR", "Held"])
     if not show_past:
         table_df = table_df[table_df["Held"]]
-    st.dataframe(table_df[["Fund Name", "XIRR"]].style.format({"XIRR": "{:.2%}"}))
+    table_df = table_df.sort_values(by="XIRR", ascending=False, na_position="last")
+    st.dataframe(table_df[["Fund Name", "XIRR"]].style.format({"XIRR": "{:.2%}"}), hide_index=True)
 
     st.header("3. Cumulative Profits Comparison")
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=portfolio_curve.index, y=portfolio_curve["TotalProfit"], mode='lines', name="Actual Portfolio", line=dict(color='red')))
     if not spy_curve.empty:
-        fig.add_trace(go.Scatter(x=spy_curve.index, y=spy_curve["TotalProfit"], mode='lines', name="S&P 500 (Hypothetical)"))
+        fig.add_trace(go.Scatter(x=spy_curve.index, y=spy_curve["TotalProfit"], mode='lines', name="S&P 500 (Hypothetical)", line=dict(color=BENCHMARK_COLOR, width=2, dash='dash')))
     fig.update_layout(title="Cumulative Profits vs S&P 500", yaxis_title="Profit ($)", xaxis_title="Date", legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01))
     st.plotly_chart(fig, use_container_width=True)
 
