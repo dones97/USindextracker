@@ -26,6 +26,14 @@ def classify_action(row):
         return "SELL"
     if "REINVESTMENT" in action:
         return "REINVEST"
+    if "DISTRIBUTION" in action:
+        # Fidelity books stock splits as a "DISTRIBUTION" of new shares (no cash moves;
+        # Amount is just the market value). A distribution with no shares is cash income.
+        try:
+            qty = float(row.get("Quantity", 0) or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        return "SHARE_DIST" if qty > 0 else "DIVIDEND"
     if "DIVIDEND" in action:
         # Reinvestment lines often say "DIVIDEND RECEIVED" then "REINVESTMENT"? 
         # Based on file check, "DIVIDEND RECEIVED" is separate from "REINVESTMENT"
@@ -76,7 +84,7 @@ def preprocess_trades(df):
     df["ActionType"] = df.apply(classify_action, axis=1)
     
     # Filter to relevant types
-    relevant_types = ["BUY", "SELL", "DIVIDEND", "REINVEST", "DEPOSIT", "WITHDRAWAL"]
+    relevant_types = ["BUY", "SELL", "DIVIDEND", "REINVEST", "DEPOSIT", "WITHDRAWAL", "SHARE_DIST"]
     df = df[df["ActionType"].isin(relevant_types)]
     
     return df
@@ -366,6 +374,28 @@ def get_cumulative_split_factor(trade_date, split_history):
         if split_date > trade_date:
             factor *= ratio
     return factor
+
+def merge_share_distributions(trades, split_history, tolerance_days=7):
+    """Add splits implied by SHARE_DIST rows that yfinance does not already report.
+
+    A distribution of D new shares on top of H held shares is a (H + D) / H split.
+    If yfinance already has a split within tolerance_days of the distribution, it is
+    left alone so the split is not applied twice.
+    """
+    splits = list(split_history or [])
+    dists = trades[trades["ActionType"] == "SHARE_DIST"].sort_values("Run Date")
+    for _, dist in dists.iterrows():
+        dist_date = dist["Run Date"]
+        if any(abs((s_date - dist_date).days) <= tolerance_days for s_date, _ in splits):
+            continue
+        prior = trades[trades["Run Date"] < dist_date]
+        held = (
+            prior.loc[prior["ActionType"].isin(["BUY", "REINVEST", "SHARE_DIST"]), "Quantity"].sum()
+            - prior.loc[prior["ActionType"] == "SELL", "Quantity"].abs().sum()
+        )
+        if held > 0:
+            splits.append((dist_date, (held + dist["Quantity"]) / held))
+    return sorted(splits, key=lambda x: x[0])
 
 def simulate_spy_portfolio(trades, spy_prices):
     if spy_prices.empty:
@@ -674,7 +704,7 @@ def main():
             continue  # Skip symbols with no price data
         trades = df[df["Symbol"] == symbol]
         prices = all_prices[symbol]
-        split_history = all_splits.get(symbol, [])
+        split_history = merge_share_distributions(trades, all_splits.get(symbol, []))
         curve = build_portfolio_profit_curve(trades, prices, split_history)
         if not curve.empty:
             profit_curves[symbol] = curve
@@ -823,6 +853,8 @@ def main():
         symbol_value = curve['CurrentValue'].iloc[-1]
         symbol_cashflows = []
         for _, row in trades.iterrows():
+            if row["ActionType"] == "SHARE_DIST":
+                continue  # No cash changes hands on a share distribution
             amt = float(row["Amount ($)"])
             symbol_cashflows.append((row["Run Date"], amt))
         if symbol_value > 0:
