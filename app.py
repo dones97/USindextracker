@@ -767,9 +767,12 @@ def databar_chart(labels, values, benchmarks, title, benchmark_name="S&P 500"):
 
     # Return % column sits in the gap between the row labels and the bars
     pct_col_px = 90
+    # Reserve the left part of the figure for labels so separators can span label, % and bar
+    max_label = max((len(str(l)) for l in labels), default=0)
+    label_frac = min(0.45, (max_label * 7 + pct_col_px + 30) / 950)
     for i, v in enumerate(values):
         fig.add_annotation(
-            x=0, xref="paper", xanchor="right", xshift=-10, y=i, yref="y",
+            x=label_frac, xref="paper", xanchor="right", xshift=-10, y=i, yref="y",
             text=f"<b>{v:.1f}%</b>" if pd.notna(v) else "n/a", showarrow=False, font=dict(size=13),
         )
     # Subtle separators between rows so each label reads across to its bar
@@ -782,15 +785,15 @@ def databar_chart(labels, values, benchmarks, title, benchmark_name="S&P 500"):
     plot_h = height - margin["t"] - margin["b"]
     fig.update_yaxes(
         type="category", tickvals=positions, ticktext=labels, autorange="reversed",
-        ticklabelstandoff=pct_col_px, automargin=True, showgrid=False,
+        ticklabelstandoff=pct_col_px, automargin=False, showgrid=False,
     )
     fig.update_layout(
         title=title,
         height=height,
         bargap=0.3,
         margin=margin,
-        xaxis=dict(range=x_range, ticksuffix="%", zeroline=True, zerolinewidth=1, showgrid=True),
-        xaxis2=dict(overlaying="x", side="top", matches="x", ticksuffix="%", showgrid=False),
+        xaxis=dict(range=x_range, domain=[label_frac, 1], ticksuffix="%", zeroline=True, zerolinewidth=1, showgrid=True),
+        xaxis2=dict(overlaying="x", side="top", matches="x", domain=[label_frac, 1], ticksuffix="%", showgrid=False),
         legend=dict(orientation="h", yanchor="bottom", y=1 + 30 / plot_h, xanchor="right", x=1.0),
     )
     return fig
