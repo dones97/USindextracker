@@ -9,6 +9,8 @@ import plotly.colors as pcolors
 import os
 import glob
 
+from portfolio_analysis import render_portfolio_analysis
+
 # S&P 500 benchmark styling, shared by every chart
 BENCHMARK_COLOR = "#2c7fb8"
 
@@ -860,257 +862,268 @@ def main():
         st.error("❌ No valid price data could be retrieved for any symbols. Please check that the symbols in your file are correct and try again.")
         return
     
-    # Portfolio-level curve: sum across all symbols
-    all_dates = sorted(set().union(*[curve.index for curve in profit_curves.values()]))
-    portfolio_curve = pd.DataFrame(index=pd.DatetimeIndex(all_dates))
-    for k, curve in profit_curves.items():
-        for col in ['Unrealized', 'Realized', 'TotalProfit', 'CurrentValue', 'CurrentQty']:
-            if col not in portfolio_curve.columns:
-                portfolio_curve[col] = 0.0
-            vals = curve[col].reindex(portfolio_curve.index).ffill().fillna(0.0)
-            portfolio_curve[col] += vals
-    for col in ['CurrentValue', 'CurrentQty']:
-        portfolio_curve[col] = portfolio_curve[col].replace(0, np.nan).ffill().fillna(0.0)
+    tab_returns, tab_analysis = st.tabs(["Returns Tracking", "Portfolio Analysis"])
 
-    # Extract daily cash balance and incorporate into portfolio curve
-    cash_series = extract_daily_cash(uploaded_files).reindex(portfolio_curve.index).ffill().fillna(0.0)
-    
-    # Track SPAXX/Cash dividends (income earned on cash)
-    cash_divs = df[df["Symbol"].isin(["SPAXX", "CASH", "FDRXX"]) & (df["ActionType"] == "DIVIDEND")]
-    if not cash_divs.empty:
-        daily_cash_div = cash_divs.groupby("Run Date")["Amount ($)"].sum()
-        cum_cash_div = daily_cash_div.reindex(portfolio_curve.index).fillna(0.0).cumsum()
-    else:
-        cum_cash_div = pd.Series(0.0, index=portfolio_curve.index)
+    with tab_returns:
+        # Portfolio-level curve: sum across all symbols
+        all_dates = sorted(set().union(*[curve.index for curve in profit_curves.values()]))
+        portfolio_curve = pd.DataFrame(index=pd.DatetimeIndex(all_dates))
+        for k, curve in profit_curves.items():
+            for col in ['Unrealized', 'Realized', 'TotalProfit', 'CurrentValue', 'CurrentQty']:
+                if col not in portfolio_curve.columns:
+                    portfolio_curve[col] = 0.0
+                vals = curve[col].reindex(portfolio_curve.index).ffill().fillna(0.0)
+                portfolio_curve[col] += vals
+        for col in ['CurrentValue', 'CurrentQty']:
+            portfolio_curve[col] = portfolio_curve[col].replace(0, np.nan).ffill().fillna(0.0)
 
-    portfolio_curve["HoldingsValue"] = portfolio_curve["CurrentValue"]
-    portfolio_curve["Cash"] = cash_series
-    portfolio_curve["CurrentValue"] += cash_series
-    portfolio_curve["Realized"] += cum_cash_div
-    portfolio_curve["TotalProfit"] = portfolio_curve["Realized"] + portfolio_curve["Unrealized"]
+        # Extract daily cash balance and incorporate into portfolio curve
+        cash_series = extract_daily_cash(uploaded_files).reindex(portfolio_curve.index).ffill().fillna(0.0)
+    
+        # Track SPAXX/Cash dividends (income earned on cash)
+        cash_divs = df[df["Symbol"].isin(["SPAXX", "CASH", "FDRXX"]) & (df["ActionType"] == "DIVIDEND")]
+        if not cash_divs.empty:
+            daily_cash_div = cash_divs.groupby("Run Date")["Amount ($)"].sum()
+            cum_cash_div = daily_cash_div.reindex(portfolio_curve.index).fillna(0.0).cumsum()
+        else:
+            cum_cash_div = pd.Series(0.0, index=portfolio_curve.index)
 
-    # End of Portfolio-level curve aggregation
-    end_date = portfolio_curve.index[-1]
-    current_portfolio_value = portfolio_curve['CurrentValue'].iloc[-1]
-    current_holdings_value = portfolio_curve['HoldingsValue'].iloc[-1]
-    current_cash_value = portfolio_curve['Cash'].iloc[-1]
+        portfolio_curve["HoldingsValue"] = portfolio_curve["CurrentValue"]
+        portfolio_curve["Cash"] = cash_series
+        portfolio_curve["CurrentValue"] += cash_series
+        portfolio_curve["Realized"] += cum_cash_div
+        portfolio_curve["TotalProfit"] = portfolio_curve["Realized"] + portfolio_curve["Unrealized"]
 
-    # Calculate Net Invested and Portfolio XIRR using External Flows (Deposits/Withdrawals)
-    # Filter for external flows
-    ext_flows = df[df["ActionType"].isin(["DEPOSIT", "WITHDRAWAL"])].copy()
+        # End of Portfolio-level curve aggregation
+        end_date = portfolio_curve.index[-1]
+        current_portfolio_value = portfolio_curve['CurrentValue'].iloc[-1]
+        current_holdings_value = portfolio_curve['HoldingsValue'].iloc[-1]
+        current_cash_value = portfolio_curve['Cash'].iloc[-1]
+
+        # Calculate Net Invested and Portfolio XIRR using External Flows (Deposits/Withdrawals)
+        # Filter for external flows
+        ext_flows = df[df["ActionType"].isin(["DEPOSIT", "WITHDRAWAL"])].copy()
     
-    # Sign convention for XIRR:
-    # Deposits (Investments) -> Negative
-    # Withdrawals (Returns) -> Positive
-    # Final Value -> Positive
+        # Sign convention for XIRR:
+        # Deposits (Investments) -> Negative
+        # Withdrawals (Returns) -> Positive
+        # Final Value -> Positive
     
-    xirr_flows = []
-    net_invested = 0.0
+        xirr_flows = []
+        net_invested = 0.0
     
-    for _, row in ext_flows.iterrows():
-        dt = row["Run Date"]
-        amt = row["Amount ($)"]
-        atype = row["ActionType"]
+        for _, row in ext_flows.iterrows():
+            dt = row["Run Date"]
+            amt = row["Amount ($)"]
+            atype = row["ActionType"]
         
-        # In file, Deposit is Positive, Withdrawal is Negative (usually).
-        # Check signs. Assuming Dep +, With -
-        if atype == "DEPOSIT":
-             # For XIRR: Negative flow (money going in)
-             xirr_flows.append((dt, -1 * abs(amt)))
-             net_invested += abs(amt)
-        elif atype == "WITHDRAWAL":
-             # For XIRR: Positive flow (money coming out)
-             xirr_flows.append((dt, abs(amt))) # File has negative, so abs() is positive
-             net_invested -= abs(amt) # Reduces net invested
+            # In file, Deposit is Positive, Withdrawal is Negative (usually).
+            # Check signs. Assuming Dep +, With -
+            if atype == "DEPOSIT":
+                 # For XIRR: Negative flow (money going in)
+                 xirr_flows.append((dt, -1 * abs(amt)))
+                 net_invested += abs(amt)
+            elif atype == "WITHDRAWAL":
+                 # For XIRR: Positive flow (money coming out)
+                 xirr_flows.append((dt, abs(amt))) # File has negative, so abs() is positive
+                 net_invested -= abs(amt) # Reduces net invested
              
-    # Append Final Value
-    xirr_flows.append((end_date, current_portfolio_value))
+        # Append Final Value
+        xirr_flows.append((end_date, current_portfolio_value))
     
-    xirr_portfolio = xirr(xirr_flows)
+        xirr_portfolio = xirr(xirr_flows)
     
-    total_profit = current_portfolio_value - net_invested
-    total_return_pct = (total_profit / net_invested) if net_invested != 0 else 0
+        total_profit = current_portfolio_value - net_invested
+        total_return_pct = (total_profit / net_invested) if net_invested != 0 else 0
 
-    # --- Calculate Risk-Free Rate and SPY Benchmark ---
-    rf_rate = get_risk_free_rate(t0, t1)
-    spy_prices = get_price_history("SPY", t0, t1)
-    # Total-return SPY series (dividends reinvested) for the per-row benchmark lines
-    spy_adj = get_price_history("SPY", t0, t1, adjusted=True)
-    port_start = df["Run Date"].min()
+        # --- Calculate Risk-Free Rate and SPY Benchmark ---
+        rf_rate = get_risk_free_rate(t0, t1)
+        spy_prices = get_price_history("SPY", t0, t1)
+        # Total-return SPY series (dividends reinvested) for the per-row benchmark lines
+        spy_adj = get_price_history("SPY", t0, t1, adjusted=True)
+        port_start = df["Run Date"].min()
 
-    valid_trades_for_spy = df[df["Symbol"].isin(symbols)]
-    spy_curve, spy_xirr_val = simulate_spy_portfolio(valid_trades_for_spy, spy_prices)
+        valid_trades_for_spy = df[df["Symbol"].isin(symbols)]
+        spy_curve, spy_xirr_val = simulate_spy_portfolio(valid_trades_for_spy, spy_prices)
     
-    spy_profit = spy_curve["TotalProfit"].iloc[-1] if not spy_curve.empty else 0.0
+        spy_profit = spy_curve["TotalProfit"].iloc[-1] if not spy_curve.empty else 0.0
     
-    # Calculate Volatilities
-    portfolio_monthly = compute_monthly_returns(portfolio_curve)
-    port_vol = portfolio_monthly.std() * np.sqrt(12) / 100.0  # Annualized volatility as decimal
+        # Calculate Volatilities
+        portfolio_monthly = compute_monthly_returns(portfolio_curve)
+        port_vol = portfolio_monthly.std() * np.sqrt(12) / 100.0  # Annualized volatility as decimal
     
-    if not spy_curve.empty:
-        spy_monthly = compute_monthly_returns(spy_curve)
-        spy_vol = spy_monthly.std() * np.sqrt(12) / 100.0
-    else:
-        spy_vol = np.nan
+        if not spy_curve.empty:
+            spy_monthly = compute_monthly_returns(spy_curve)
+            spy_vol = spy_monthly.std() * np.sqrt(12) / 100.0
+        else:
+            spy_vol = np.nan
         
-    # Calculate Sharpe Ratios
-    port_sharpe = (xirr_portfolio - rf_rate) / port_vol if port_vol > 0 else np.nan
-    spy_sharpe = (spy_xirr_val - rf_rate) / spy_vol if spy_vol > 0 else np.nan
+        # Calculate Sharpe Ratios
+        port_sharpe = (xirr_portfolio - rf_rate) / port_vol if port_vol > 0 else np.nan
+        spy_sharpe = (spy_xirr_val - rf_rate) / spy_vol if spy_vol > 0 else np.nan
 
-    # --- 1. Portfolio Level Metrics ---
-    st.header("1. Portfolio-level Metrics")
-    st.caption(f"Risk-Free Rate (T-Bill historical average used for Sharpe): {rf_rate:.2%}")
+        # --- 1. Portfolio Level Metrics ---
+        st.header("1. Portfolio-level Metrics")
+        st.caption(f"Risk-Free Rate (T-Bill historical average used for Sharpe): {rf_rate:.2%}")
     
-    # Get realized and unrealized gains from the portfolio curve
-    portfolio_realized = portfolio_curve['Realized'].iloc[-1]
-    portfolio_unrealized = portfolio_curve['Unrealized'].iloc[-1]
+        # Get realized and unrealized gains from the portfolio curve
+        portfolio_realized = portfolio_curve['Realized'].iloc[-1]
+        portfolio_unrealized = portfolio_curve['Unrealized'].iloc[-1]
     
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Your Portfolio")
-        st.write(f"**Total Profit ($):** {total_profit:,.2f}")
-        st.write(f"**Realized Gains/Losses ($):** {portfolio_realized:,.2f}")
-        st.write(f"**Unrealized Gains/Losses ($):** {portfolio_unrealized:,.2f}")
-        st.write(f"**Portfolio XIRR:** {xirr_portfolio:.2%}")
-        st.write(f"**Annualized Volatility:** {port_vol:.2%}")
-        st.write(f"**Sharpe Ratio:** {port_sharpe:.2f}")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Your Portfolio")
+            st.write(f"**Total Profit ($):** {total_profit:,.2f}")
+            st.write(f"**Realized Gains/Losses ($):** {portfolio_realized:,.2f}")
+            st.write(f"**Unrealized Gains/Losses ($):** {portfolio_unrealized:,.2f}")
+            st.write(f"**Portfolio XIRR:** {xirr_portfolio:.2%}")
+            st.write(f"**Annualized Volatility:** {port_vol:.2%}")
+            st.write(f"**Sharpe Ratio:** {port_sharpe:.2f}")
 
-    with col2:
-        st.subheader("S&P 500 Benchmark (If fully invested)")
-        st.write(f"**Total Profit ($):** {spy_profit:,.2f}")
-        st.write(f"**S&P 500 XIRR:** {spy_xirr_val:.2%}")
-        st.write(f"**Annualized Volatility:** {spy_vol:.2%}")
-        st.write(f"**Sharpe Ratio:** {spy_sharpe:.2f}")
+        with col2:
+            st.subheader("S&P 500 Benchmark (If fully invested)")
+            st.write(f"**Total Profit ($):** {spy_profit:,.2f}")
+            st.write(f"**S&P 500 XIRR:** {spy_xirr_val:.2%}")
+            st.write(f"**Annualized Volatility:** {spy_vol:.2%}")
+            st.write(f"**Sharpe Ratio:** {spy_sharpe:.2f}")
     
-    st.info(f"Net Invested: ${net_invested:,.2f} | Current Value: ${current_portfolio_value:,.2f} (Holdings: ${current_holdings_value:,.2f}, Cash / SPAXX: ${current_cash_value:,.2f})")
+        st.info(f"Net Invested: ${net_invested:,.2f} | Current Value: ${current_portfolio_value:,.2f} (Holdings: ${current_holdings_value:,.2f}, Cash / SPAXX: ${current_cash_value:,.2f})")
 
-    # --- 2. Symbol-level comparison & XIRR table ---
-    st.header("2. Fund Performance vs S&P 500")
-    symbol_xirr = []
-    symbol_total_return = []
+        # --- 2. Symbol-level comparison & XIRR table ---
+        st.header("2. Fund Performance vs S&P 500")
+        symbol_xirr = []
+        symbol_total_return = []
     
-    # Sort symbols by current value (descending) for better display, or just alphabetical
-    # Using original order for now but filtered
-    for symbol in symbols:
-        if symbol not in profit_curves:
-            continue
+        # Sort symbols by current value (descending) for better display, or just alphabetical
+        # Using original order for now but filtered
+        for symbol in symbols:
+            if symbol not in profit_curves:
+                continue
             
-        trades = df[df["Symbol"] == symbol]
-        # curve is guaranteed to exist now
-        curve = profit_curves[symbol]
-        end_date = curve.index[-1]
-        symbol_value = curve['CurrentValue'].iloc[-1]
-        symbol_cashflows = []
-        for _, row in trades.iterrows():
-            if row["ActionType"] == "SHARE_DIST":
-                continue  # No cash changes hands on a share distribution
-            amt = float(row["Amount ($)"])
-            symbol_cashflows.append((row["Run Date"], amt))
-        if symbol_value > 0:
-            symbol_cashflows.append((end_date, symbol_value))
-        sym_xirr = xirr(symbol_cashflows)
+            trades = df[df["Symbol"] == symbol]
+            # curve is guaranteed to exist now
+            curve = profit_curves[symbol]
+            end_date = curve.index[-1]
+            symbol_value = curve['CurrentValue'].iloc[-1]
+            symbol_cashflows = []
+            for _, row in trades.iterrows():
+                if row["ActionType"] == "SHARE_DIST":
+                    continue  # No cash changes hands on a share distribution
+                amt = float(row["Amount ($)"])
+                symbol_cashflows.append((row["Run Date"], amt))
+            if symbol_value > 0:
+                symbol_cashflows.append((end_date, symbol_value))
+            sym_xirr = xirr(symbol_cashflows)
         
-        # Simple Return for Symbol: (Value + CashOut) / CashIn - 1?
-        # Or just (Profit / CashIn)
-        # CashIn = Cost of Buys
-        cash_in = sum([abs(row["Amount ($)"]) for _, row in trades.iterrows() if row["ActionType"] in ["BUY", "REINVEST"] and row["Amount ($)"] < 0]) 
-        # Note: BUY amount usually negative in file?
-        # Let's be careful. If preprocess_trades didn't enforce sign, we check.
-        # User file inspection: BUY -Amount? No, typically "Amount" is cost.
-        # Let's rely on 'amount' being negative for money spent if we didn't force it?
-        # In preprocess: we strip $ and ().
-        # Let's Assume: BUY cost is implied by Quantity * Price?
-        # Better: use logic from profit curve building (Cost Basis)
+            # Simple Return for Symbol: (Value + CashOut) / CashIn - 1?
+            # Or just (Profit / CashIn)
+            # CashIn = Cost of Buys
+            cash_in = sum([abs(row["Amount ($)"]) for _, row in trades.iterrows() if row["ActionType"] in ["BUY", "REINVEST"] and row["Amount ($)"] < 0]) 
+            # Note: BUY amount usually negative in file?
+            # Let's be careful. If preprocess_trades didn't enforce sign, we check.
+            # User file inspection: BUY -Amount? No, typically "Amount" is cost.
+            # Let's rely on 'amount' being negative for money spent if we didn't force it?
+            # In preprocess: we strip $ and ().
+            # Let's Assume: BUY cost is implied by Quantity * Price?
+            # Better: use logic from profit curve building (Cost Basis)
         
-        # Let's grab cumulative profit from curve
-        sym_profit = curve['TotalProfit'].iloc[-1]
+            # Let's grab cumulative profit from curve
+            sym_profit = curve['TotalProfit'].iloc[-1]
         
-        # Invested estimate: Current Cost Basis? No, that misses sold items.
-        # Sum of all BUYS cost.
-        buy_rows = trades[trades["ActionType"].isin(["BUY", "REINVEST"])]
-        # Cost is roughly sum of amounts (since file likely has negative amounts for buys or we treat them as cost)
-        # Actually in file "Amount ($)" for BUY is usually negative.
-        # Let's sum abs(Amount) for BUYs.
-        invested = buy_rows["Amount ($)"].abs().sum()
+            # Invested estimate: Current Cost Basis? No, that misses sold items.
+            # Sum of all BUYS cost.
+            buy_rows = trades[trades["ActionType"].isin(["BUY", "REINVEST"])]
+            # Cost is roughly sum of amounts (since file likely has negative amounts for buys or we treat them as cost)
+            # Actually in file "Amount ($)" for BUY is usually negative.
+            # Let's sum abs(Amount) for BUYs.
+            invested = buy_rows["Amount ($)"].abs().sum()
         
-        total_ret = (sym_profit / invested) if invested != 0 else 0
-        fund_name = symbol_name_map.get(symbol, symbol)
-        is_held = curve['CurrentQty'].iloc[-1] > 1e-4
-        # Benchmark over the holding period: to today if still held, else to the last trade
-        hold_end = curve.index[-1] if is_held else trades["Run Date"].max()
-        spy_ret = benchmark_return_for_trades(trades, spy_adj, invested, hold_end)
-        spy_xirr_pct = benchmark_xirr_for_trades(trades, spy_adj, hold_end)
-        symbol_xirr.append((symbol, fund_name, sym_xirr * 100, spy_xirr_pct, is_held))
-        symbol_total_return.append((fund_name, total_ret * 100, spy_ret, is_held))
+            total_ret = (sym_profit / invested) if invested != 0 else 0
+            fund_name = symbol_name_map.get(symbol, symbol)
+            is_held = curve['CurrentQty'].iloc[-1] > 1e-4
+            # Benchmark over the holding period: to today if still held, else to the last trade
+            hold_end = curve.index[-1] if is_held else trades["Run Date"].max()
+            spy_ret = benchmark_return_for_trades(trades, spy_adj, invested, hold_end)
+            spy_xirr_pct = benchmark_xirr_for_trades(trades, spy_adj, hold_end)
+            symbol_xirr.append((symbol, fund_name, sym_xirr * 100, spy_xirr_pct, is_held))
+            symbol_total_return.append((fund_name, total_ret * 100, spy_ret, is_held))
 
-    show_past = st.checkbox("Show past investments (fully sold funds/ETFs)", value=False)
-    st.subheader("Total Return")
+        show_past = st.checkbox("Show past investments (fully sold funds/ETFs)", value=False)
+        st.subheader("Total Return")
 
-    # Data-bar chart: total return % per fund vs S&P 500 over the same holding period
-    sym_df = pd.DataFrame(symbol_total_return, columns=["Fund Name", "TotalReturn", "SPYReturn", "Held"])
-    if not show_past:
-        sym_df = sym_df[sym_df["Held"]]
-    sym_df = sym_df.sort_values(by="TotalReturn", ascending=False)
+        # Data-bar chart: total return % per fund vs S&P 500 over the same holding period
+        sym_df = pd.DataFrame(symbol_total_return, columns=["Fund Name", "TotalReturn", "SPYReturn", "Held"])
+        if not show_past:
+            sym_df = sym_df[sym_df["Held"]]
+        sym_df = sym_df.sort_values(by="TotalReturn", ascending=False)
 
-    if sym_df.empty:
-        st.info("No funds/ETFs to show. Tick the box above to include past investments.")
-    else:
+        if sym_df.empty:
+            st.info("No funds/ETFs to show. Tick the box above to include past investments.")
+        else:
+            fig = databar_chart(
+                sym_df["Fund Name"].tolist(), sym_df["TotalReturn"], sym_df["SPYReturn"],
+                title="Fund Total Return (%)",
+                benchmark_name="S&P 500 (same cash flows, same holding period)",
+            )
+            st.plotly_chart(fig, width="stretch")
+
+        # Data-bar chart: XIRR per fund vs S&P 500 XIRR on the same cash flows
+        st.subheader("Annualized Return (XIRR)")
+        xirr_df = pd.DataFrame(symbol_xirr, columns=["Symbol", "Fund Name", "XIRR", "SPYXIRR", "Held"])
+        if not show_past:
+            xirr_df = xirr_df[xirr_df["Held"]]
+        xirr_df = xirr_df.sort_values(by="XIRR", ascending=False, na_position="last")
+        if not xirr_df.empty:
+            fig = databar_chart(
+                xirr_df["Fund Name"].tolist(), xirr_df["XIRR"], xirr_df["SPYXIRR"],
+                title="Fund XIRR (%)",
+                benchmark_name="S&P 500 XIRR (same cash flows, same holding period)",
+            )
+            st.plotly_chart(fig, width="stretch")
+
+        st.header("3. Cumulative Profits Comparison")
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=portfolio_curve.index, y=portfolio_curve["TotalProfit"], mode='lines', name="Actual Portfolio", line=dict(color='red')))
+        if not spy_curve.empty:
+            fig.add_trace(go.Scatter(x=spy_curve.index, y=spy_curve["TotalProfit"], mode='lines', name="S&P 500 (Hypothetical)", line=dict(color=BENCHMARK_COLOR, width=2)))
+        fig.update_layout(title="Cumulative Profits vs S&P 500", yaxis_title="Profit ($)", xaxis_title="Date", legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01))
+        st.plotly_chart(fig, width="stretch")
+
+        # --- 4. Annual Returns Bar Chart ---
+        st.header("4. Annual Returns (%)")
+        port_end = portfolio_curve.index[-1]
+        annual_returns = compute_annual_returns(portfolio_curve)
+        # Drop periods that ended before the first trade (curve starts a few days early)
+        annual_returns = annual_returns[annual_returns.index >= port_start]
+        annual_spy = benchmark_period_returns(spy_adj, annual_returns.index, "Y", port_start, port_end)
+        years = [d.strftime("%Y") for d in annual_returns.index]
         fig = databar_chart(
-            sym_df["Fund Name"].tolist(), sym_df["TotalReturn"], sym_df["SPYReturn"],
-            title="Fund Total Return (%)",
-            benchmark_name="S&P 500 (same cash flows, same holding period)",
+            years, annual_returns.values, annual_spy.values,
+            title="Annual Returns (%)",
+            benchmark_name="S&P 500 (portfolio's active dates only)",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
-    # Data-bar chart: XIRR per fund vs S&P 500 XIRR on the same cash flows
-    st.subheader("Annualized Return (XIRR)")
-    xirr_df = pd.DataFrame(symbol_xirr, columns=["Symbol", "Fund Name", "XIRR", "SPYXIRR", "Held"])
-    if not show_past:
-        xirr_df = xirr_df[xirr_df["Held"]]
-    xirr_df = xirr_df.sort_values(by="XIRR", ascending=False, na_position="last")
-    if not xirr_df.empty:
+        # --- 5. Monthly Returns Bar Chart ---
+        st.header("5. Monthly Returns (%)")
+        monthly_returns = compute_monthly_returns(portfolio_curve)
+        monthly_returns = monthly_returns[monthly_returns.index >= port_start]
+        monthly_spy = benchmark_period_returns(spy_adj, monthly_returns.index, "M", port_start, port_end)
+        months = [d.strftime("%Y-%m") for d in monthly_returns.index]
         fig = databar_chart(
-            xirr_df["Fund Name"].tolist(), xirr_df["XIRR"], xirr_df["SPYXIRR"],
-            title="Fund XIRR (%)",
-            benchmark_name="S&P 500 XIRR (same cash flows, same holding period)",
+            months, monthly_returns.values, monthly_spy.values,
+            title="Monthly Returns (%)",
+            benchmark_name="S&P 500 (portfolio's active dates only)",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
-    st.header("3. Cumulative Profits Comparison")
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=portfolio_curve.index, y=portfolio_curve["TotalProfit"], mode='lines', name="Actual Portfolio", line=dict(color='red')))
-    if not spy_curve.empty:
-        fig.add_trace(go.Scatter(x=spy_curve.index, y=spy_curve["TotalProfit"], mode='lines', name="S&P 500 (Hypothetical)", line=dict(color=BENCHMARK_COLOR, width=2)))
-    fig.update_layout(title="Cumulative Profits vs S&P 500", yaxis_title="Profit ($)", xaxis_title="Date", legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01))
-    st.plotly_chart(fig, use_container_width=True)
-
-    # --- 4. Annual Returns Bar Chart ---
-    st.header("4. Annual Returns (%)")
-    port_end = portfolio_curve.index[-1]
-    annual_returns = compute_annual_returns(portfolio_curve)
-    # Drop periods that ended before the first trade (curve starts a few days early)
-    annual_returns = annual_returns[annual_returns.index >= port_start]
-    annual_spy = benchmark_period_returns(spy_adj, annual_returns.index, "Y", port_start, port_end)
-    years = [d.strftime("%Y") for d in annual_returns.index]
-    fig = databar_chart(
-        years, annual_returns.values, annual_spy.values,
-        title="Annual Returns (%)",
-        benchmark_name="S&P 500 (portfolio's active dates only)",
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    # --- 5. Monthly Returns Bar Chart ---
-    st.header("5. Monthly Returns (%)")
-    monthly_returns = compute_monthly_returns(portfolio_curve)
-    monthly_returns = monthly_returns[monthly_returns.index >= port_start]
-    monthly_spy = benchmark_period_returns(spy_adj, monthly_returns.index, "M", port_start, port_end)
-    months = [d.strftime("%Y-%m") for d in monthly_returns.index]
-    fig = databar_chart(
-        months, monthly_returns.values, monthly_spy.values,
-        title="Monthly Returns (%)",
-        benchmark_name="S&P 500 (portfolio's active dates only)",
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    with tab_analysis:
+        # Current market value of each fund still held; cash is handled separately
+        holdings = {
+            sym: curve["CurrentValue"].iloc[-1] for sym, curve in profit_curves.items()
+            if curve["CurrentQty"].iloc[-1] > 1e-4 and curve["CurrentValue"].iloc[-1] > 0
+        }
+        render_portfolio_analysis(holdings, symbol_name_map, rf_rate, current_cash_value)
 
 if __name__ == "__main__":
     main()
